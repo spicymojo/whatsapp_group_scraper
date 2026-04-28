@@ -1,0 +1,10 @@
+.venv
+__pycache__
+.git
+.idea
+downloads/*
+!downloads/.gitkeep
+qr.png
+*.db-journal
+*.db-shm
+*.db-wal

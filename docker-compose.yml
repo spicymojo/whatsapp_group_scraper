@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  whatsapp-newspaper:
+    build: .
+    container_name: whatsapp-newspaper
+    restart: unless-stopped
+    volumes:
+      - .:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONIOENCODING=utf-8
+    # If you want to use the .env file in this directory
+    env_file:
+      - .env
