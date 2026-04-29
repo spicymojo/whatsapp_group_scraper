@@ -1,11 +1,11 @@
-# 📰 WhatsApp Newspaper Auto-Forwarder
+# 📰 WhatsApp Group Scraper
 
-A robust, automated WhatsApp bot that monitors a specific group for a daily newspaper PDF, downloads it, renames it with a clean Spanish date format, and forwards it to a designated contact. Built with Python and the neonize library.
+A robust, automated WhatsApp bot that monitors a specific group for a daily newspaper PDF, downloads it, renames it with a clean Spanish date format, and forwards it to a designated contact. Built with Python and the [neonize](https://github.com/krypton-byte/neonize) library.
 
 ## ✨ Features
 
-* **Targeted Monitoring:** Scans specific WhatsApp groups for files matching a keyword (e.g., "La Provincia Las Palmas").
-* **Smart Renaming:** Automatically converts raw filenames into a clean format (e.g., `La Provincia, 16 de Marzo.pdf`).
+* **Targeted Monitoring:** Scans specific WhatsApp groups for files matching a keyword (e.g., "La Monda").
+* **Smart Renaming:** Automatically converts raw filenames into a clean format (e.g., `La Monda, 16 de Marzo.pdf`).
 * **Resilient Downloading:** Uses a 3-tier fallback strategy (Raw Message -> Pointer -> Low-Level Decryption) to bypass WhatsApp Web mesh `wire-format` sync errors.
 * **Daily Lockdown:** Creates a persistent `last_sent.txt` log to ensure the file is only forwarded once per day, even if the script or the server restarts.
 * **Quiet Hours:** Ignores files sent before 7:00 AM to avoid premature triggers.
@@ -21,8 +21,8 @@ A robust, automated WhatsApp bot that monitors a specific group for a daily news
 
 1. **Clone the repository:**
    ```bash
-   git clone [https://github.com/yourusername/whatsapp-newspaper-forwarder.git](https://github.com/yourusername/whatsapp-newspaper-forwarder.git)
-   cd whatsapp-newspaper-forwarder
+   git clone [https://github.com/yourusername/whatsapp_group_scraper.git](https://github.com/yourusername/whatsapp_group_scraper.git)
+   cd whatsapp_group_scraper
    ```
 
 2. **Create a virtual environment (Recommended):**
@@ -43,9 +43,9 @@ A robust, automated WhatsApp bot that monitors a specific group for a daily news
      ```
    * Open `.env` and fill in your details:
      ```ini
-     TARGET_GROUP_ID=1234567890@g.us
-     TARGET_RECIPIENT=34600000000
-     SEARCH_TERM=La Provincia Las Palmas
+     TARGET_GROUP_ID=1234567890@g.us       # The ID of the group to monitor
+     TARGET_RECIPIENT=34600000000          # The phone number to forward the PDF to
+     SEARCH_TERM=La Monda                  # The keyword to look for in the filename
      ```
 
 ## 💻 Usage (Local Testing)
@@ -82,8 +82,8 @@ Running it as a service ensures the bot automatically restarts if it crashes or 
    [Service]
    Type=simple
    User=pi
-   WorkingDirectory=/home/pi/whatsapp-newspaper-forwarder
-   ExecStart=/home/pi/whatsapp-newspaper-forwarder/.venv/bin/python scraper.py
+   WorkingDirectory=/home/pi/whatsapp_group_scraper
+   ExecStart=/home/pi/whatsapp_group_scraper/.venv/bin/python scraper.py
    Restart=on-failure
    RestartSec=10
 

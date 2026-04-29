@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the requirements (since we don't have requirements.txt, we install manually)
-RUN pip install --no-cache-dir neonize python-dotenv
+RUN pip install --no-cache-dir neonize python-dotenv telethon
 
 # Copy the rest of the application code
 COPY . .

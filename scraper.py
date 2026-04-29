@@ -1,22 +1,42 @@
 import os
 import sys
 import time
+import argparse
 from datetime import datetime, date
 from dotenv import load_dotenv
 from neonize.client import NewClient
 from neonize.events import MessageEv, ConnectedEv
 from neonize.utils import build_jid
+from telethon.sync import TelegramClient
 from naming_utils import get_newspaper_name
 
 # --- CONFIGURATION (Loaded from .env) ---
 load_dotenv()
 
 TARGET_GROUP_ID = os.getenv("TARGET_GROUP_ID")
-TARGET_RECIPIENT = os.getenv("TARGET_RECIPIENT")
 SEARCH_TERM = os.getenv("SEARCH_TERM", "La Provincia Las Palmas")
+
+# Telegram config
+TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
+TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
+TELEGRAM_PHONE_NUMBER = os.getenv("TELEGRAM_PHONE_NUMBER", "")
+TELEGRAM_NEWSPAPERS_CHAT_ID = os.getenv("TELEGRAM_NEWSPAPERS_CHAT_ID", "")
+TELEGRAM_NEWSPAPERS_CHAT_NAME = os.getenv("TELEGRAM_NEWSPAPERS_CHAT_NAME", "")
+TELEGRAM_SESSION_PATH = os.getenv("TELEGRAM_SESSION_PATH", "telegram_session")
 
 DOWNLOAD_PATH = "downloads"
 SENT_LOG_FILE = "last_sent.txt"
+
+# --- CLI ARGUMENTS ---
+parser = argparse.ArgumentParser(description="WhatsApp newspaper scraper")
+parser.add_argument(
+    "--skip-date-check",
+    action="store_true",
+    default=os.getenv("SKIP_DATE_CHECK", "false").lower() in ("true", "1", "yes"),
+    help="Skip the once-a-day check (useful for development)"
+)
+args = parser.parse_args()
+SKIP_DATE_CHECK = args.skip_date_check
 
 # --- STATE TRACKING ---
 PROCESSED_MESSAGES = set()
@@ -29,6 +49,13 @@ if os.path.exists(SENT_LOG_FILE):
 client = NewClient("session.db")
 
 
+def already_sent_today():
+    """Check if we already sent today's paper (respects skip flag)."""
+    if SKIP_DATE_CHECK:
+        return False
+    return str(date.today()) == LAST_SENT_DATE
+
+
 def save_sent_date():
     today_str = str(date.today())
     with open(SENT_LOG_FILE, "w") as f:
@@ -36,31 +63,44 @@ def save_sent_date():
     return today_str
 
 
-def send_to_target(client, file_path, custom_name):
-    """Builds the document and sends it to a properly formatted JID."""
-    print(f"📤 Sending '{custom_name}' to {TARGET_RECIPIENT}...")
+def _resolve_telegram_chat(tg_client):
+    """Resolve the target Telegram chat: use ID if available, otherwise search by name."""
+    if TELEGRAM_NEWSPAPERS_CHAT_ID:
+        chat_id = int(TELEGRAM_NEWSPAPERS_CHAT_ID)
+        print(f"📌 Using chat ID: {chat_id}")
+        return chat_id
+
+    # Fallback: search by name
+    for dialog in tg_client.iter_dialogs():
+        if TELEGRAM_NEWSPAPERS_CHAT_NAME in dialog.name:
+            print(f"📌 Found chat by name: {dialog.name} (ID: {dialog.id})")
+            return dialog.id
+
+    return None
+
+
+def send_to_telegram(file_path, custom_name):
+    """Send the downloaded newspaper PDF to the Telegram newspapers chat."""
+    print(f"📤 Sending '{custom_name}' to Telegram...")
+    tg_client = None
     try:
-        with open(file_path, "rb") as f:
-            file_data = f.read()
+        tg_client = TelegramClient(TELEGRAM_SESSION_PATH, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+        tg_client.start(phone=TELEGRAM_PHONE_NUMBER)
 
-        doc_msg = client.build_document_message(
-            file_data,
-            filename=custom_name,
-            caption=f"Here is your newspaper: {custom_name}",
-            mimetype="application/pdf"
-        )
+        target_chat = _resolve_telegram_chat(tg_client)
+        if target_chat is None:
+            print(f"❌ Could not find Telegram chat '{TELEGRAM_NEWSPAPERS_CHAT_NAME}'")
+            return False
 
-        # Format the phone number properly
-        clean_number = TARGET_RECIPIENT.replace("@s.whatsapp.net", "")
-        target_jid = build_jid(clean_number)
-
-        client.send_message(target_jid, message=doc_msg)
-
-        print(f"🚀 Sent successfully!")
+        tg_client.send_file(target_chat, file_path, caption=custom_name)
+        print(f"🚀 Sent to Telegram successfully!")
         return True
     except Exception as e:
-        print(f"❌ Failed to send: {e}")
+        print(f"❌ Failed to send to Telegram: {e}")
         return False
+    finally:
+        if tg_client:
+            tg_client.disconnect()
 
 
 def download_file(client, message_ev):
@@ -75,7 +115,7 @@ def download_file(client, message_ev):
 
     if os.path.exists(path) and os.path.getsize(path) > 0:
         print(f"📦 File already exists locally. Attempting to send...")
-        if send_to_target(client, path, custom_name):
+        if send_to_telegram(path, custom_name):
             LAST_SENT_DATE = save_sent_date()
             return True
 
@@ -99,7 +139,7 @@ def download_file(client, message_ev):
                         f.write(data)
                     print(f"✅ Download successful via Strategy {name}.")
 
-                    if send_to_target(client, path, custom_name):
+                    if send_to_telegram(path, custom_name):
                         LAST_SENT_DATE = save_sent_date()
                         return True
                     else:
@@ -119,7 +159,7 @@ def on_message(client: NewClient, message: MessageEv):
     global LAST_SENT_DATE
     try:
         # Stop processing if we already sent today's paper
-        if str(date.today()) == LAST_SENT_DATE:
+        if already_sent_today():
             return
 
         msg_id = message.Info.ID
@@ -152,9 +192,11 @@ def on_message(client: NewClient, message: MessageEv):
 
 @client.event(ConnectedEv)
 def on_connected(client: NewClient, event: ConnectedEv):
-    print(f"🚀 Monitoring Group: {TARGET_GROUP_ID}")
-    status = "Pending" if LAST_SENT_DATE != str(date.today()) else "Completed"
+    mode = "DEV (skip-date-check)" if SKIP_DATE_CHECK else "PRODUCTION"
+    print(f"🚀 Monitoring Group: {TARGET_GROUP_ID} [{mode}]")
+    status = "Pending" if not already_sent_today() else "Completed"
     print(f"📅 Today's status: {status}")
+    print(f"📨 Telegram target: {TELEGRAM_NEWSPAPERS_CHAT_NAME}")
 
 
 if __name__ == "__main__":
