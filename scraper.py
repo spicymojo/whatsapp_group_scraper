@@ -92,7 +92,7 @@ def send_to_telegram(file_path, custom_name):
             print(f"❌ Could not find Telegram chat '{TELEGRAM_NEWSPAPERS_CHAT_NAME}'")
             return False
 
-        tg_client.send_file(target_chat, file_path, caption=custom_name)
+        tg_client.send_file(target_chat, file_path)
         print(f"🚀 Sent to Telegram successfully!")
         return True
     except Exception as e:
@@ -197,6 +197,18 @@ def on_connected(client: NewClient, event: ConnectedEv):
     status = "Pending" if not already_sent_today() else "Completed"
     print(f"📅 Today's status: {status}")
     print(f"📨 Telegram target: {TELEGRAM_NEWSPAPERS_CHAT_NAME}")
+
+    # Log all groups to help discover group IDs
+    print("\n📋 Your WhatsApp groups:")
+    try:
+        groups = client.get_joined_groups()
+        for g in groups:
+            gid = f"{g.JID.User}@{g.JID.Server}"
+            name = g.GroupName.Name if hasattr(g.GroupName, 'Name') else 'Unknown'
+            print(f"   • {name} → {gid}")
+    except Exception as e:
+        print(f"   ⚠️ Could not list groups: {e}")
+    print()
 
 
 def _ensure_telegram_session():
