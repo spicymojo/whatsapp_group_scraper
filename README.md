@@ -1,112 +1,132 @@
 # 📰 WhatsApp Group Scraper
 
-A robust, automated WhatsApp bot that monitors a specific group for a daily newspaper PDF, downloads it, renames it with a clean Spanish date format, and forwards it to a designated contact. Built with Python and the [neonize](https://github.com/krypton-byte/neonize) library.
+A robust, automated WhatsApp bot that monitors a specific group for a daily newspaper PDF, downloads it, renames it with a clean Spanish date format, and forwards it to a Telegram chat. Built with Python, [neonize](https://github.com/krypton-byte/neonize) (WhatsApp), and [Telethon](https://github.com/LonamiWebs/Telethon) (Telegram).
 
 ## ✨ Features
 
-* **Targeted Monitoring:** Scans specific WhatsApp groups for files matching a keyword (e.g., "La Monda").
-* **Smart Renaming:** Automatically converts raw filenames into a clean format (e.g., `La Monda, 16 de Marzo.pdf`).
-* **Resilient Downloading:** Uses a 3-tier fallback strategy (Raw Message -> Pointer -> Low-Level Decryption) to bypass WhatsApp Web mesh `wire-format` sync errors.
-* **Daily Lockdown:** Creates a persistent `last_sent.txt` log to ensure the file is only forwarded once per day, even if the script or the server restarts.
+* **Targeted Monitoring:** Scans specific WhatsApp groups for files matching a keyword (e.g., "La Provincia Las Palmas").
+* **Smart Renaming:** Automatically converts raw filenames into a clean format (e.g., `La Provincia, 16 de Marzo.pdf`).
+* **Telegram Delivery:** Forwards the downloaded PDF to a configured Telegram chat.
+* **Resilient Downloading:** Uses a 3-tier fallback strategy (Raw Message → Pointer → Low-Level Decryption) to handle WhatsApp download issues.
+* **Daily Lockdown:** Creates a persistent `last_sent.txt` log to ensure the file is only forwarded once per day, even if the script restarts.
 * **Quiet Hours:** Ignores files sent before 7:00 AM to avoid premature triggers.
-* **Secure Configuration:** Uses `.env` variables so your personal phone numbers and group IDs are never exposed in the code.
+* **Dev Mode:** Use `SKIP_DATE_CHECK=true` or `--skip-date-check` to bypass the once-a-day restriction during development.
 
-## 📋 Prerequisites
+## 🐳 Docker / Unraid Deployment (Recommended)
 
-* Python 3.8 or higher.
-* A linked WhatsApp device (the script generates a `session.db` file upon first login).
-* **For Raspberry Pi:** A terminal multiplexer like `tmux` or `systemd` to keep the script running in the background.
+### Folder Structure
 
-## 🚀 Installation & Setup
-
-1. **Clone the repository:**
-   ```bash
-   git clone [https://github.com/yourusername/whatsapp_group_scraper.git](https://github.com/yourusername/whatsapp_group_scraper.git)
-   cd whatsapp_group_scraper
-   ```
-
-2. **Create a virtual environment (Recommended):**
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
-   ```
-
-3. **Install dependencies:**
-   ```bash
-   pip install neonize python-dotenv
-   ```
-
-4. **Configure your environment variables:**
-   * Copy the example environment file:
-     ```bash
-     cp .env.example .env
-     ```
-   * Open `.env` and fill in your details:
-     ```ini
-     TARGET_GROUP_ID=1234567890@g.us       # The ID of the group to monitor
-     TARGET_RECIPIENT=34600000000          # The phone number to forward the PDF to
-     SEARCH_TERM=La Monda                  # The keyword to look for in the filename
-     ```
-
-## 💻 Usage (Local Testing)
-
-Run the script locally for the first time:
-```bash
-python scraper.py
 ```
-* **First Login:** The console will output a QR code. Scan it with your WhatsApp app (Linked Devices) to authenticate.
-* Once authenticated, a `session.db` file will be created in your folder. **Do not commit this file to GitHub.**
+/mnt/user/appdata/bots/
+├── compose.yaml
+├── .env                          # Shared or per-bot env config
+└── whatsapp_group_scraper/       # This repo (git clone)
+    ├── Dockerfile
+    ├── scraper.py
+    ├── naming_utils.py
+    ├── session.db                # Created after WhatsApp QR scan
+    └── telegram_session.session  # Created after Telegram auth
+```
 
-## 🍓 Raspberry Pi Deployment
+### 1. Clone the repo on Unraid
 
-To run this 24/7 on a Raspberry Pi without needing to scan the QR code again:
+```bash
+cd /mnt/user/appdata/bots
+git clone https://github.com/spicymojo/whatsapp_group_scraper.git
+```
 
-1. **Transfer the Session:** Copy your locally generated `session.db` file directly to the project folder on your Raspberry Pi via SCP or SFTP.
-2. **Pull the code & install requirements:** Run the installation steps (1-3) on your Pi.
-3. **Keep it running:** You can use `tmux` or create a `systemd` service.
+### 2. Create your `.env` file
 
-### Option: Running as a `systemd` Background Service (Recommended)
+Create `.env` at the `bots/` level (or inside the project folder):
 
-Running it as a service ensures the bot automatically restarts if it crashes or if the Raspberry Pi reboots.
+```ini
+TARGET_GROUP_ID=120363402800142448@g.us
+SEARCH_TERM=La Provincia Las Palmas
 
-1. Create a service file:
+# Telegram delivery config
+TELEGRAM_API_ID=your_api_id
+TELEGRAM_API_HASH=your_api_hash
+TELEGRAM_PHONE_NUMBER=+34600000000
+TELEGRAM_NEWSPAPERS_CHAT_NAME=Your Chat Name
+TELEGRAM_NEWSPAPERS_CHAT_ID=1234567890
+TELEGRAM_SESSION_PATH=telegram_session
+
+SKIP_DATE_CHECK=false
+```
+
+### 3. Compose config
+
+In your `compose.yaml`:
+
+```yaml
+services:
+  whatsapp-newspaper:
+    build: ./whatsapp_group_scraper
+    container_name: whatsapp-newspaper
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./whatsapp_group_scraper:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONIOENCODING=utf-8
+    env_file:
+      - ./.env
+```
+
+### 4. First-time authentication
+
+Both WhatsApp and Telegram need a one-time interactive login:
+
+```bash
+# Build and start the container
+docker compose up -d --build
+
+# Attach to enter auth codes
+docker attach whatsapp-newspaper
+```
+
+1. **WhatsApp QR:** A QR code will appear in the logs. Scan it with WhatsApp → Settings → Linked Devices.
+2. **Telegram code:** When a newspaper is first detected, Telethon will ask `Please enter the code you received:`. Type the code sent to your Telegram app and press Enter.
+3. **Detach** with `Ctrl+P, Ctrl+Q` (do NOT use Ctrl+C, that stops the container).
+
+After this, both `session.db` and `telegram_session.session` are persisted in the volume — no need to re-authenticate unless sessions expire.
+
+### 5. Updating the code
+
+```bash
+cd /mnt/user/appdata/bots/whatsapp_group_scraper
+git pull
+cd ..
+docker compose down
+docker compose up -d --build
+```
+
+## 💻 Local Development
+
+1. **Install dependencies:**
    ```bash
-   sudo nano /etc/systemd/system/wabot.service
+   pip install neonize python-dotenv telethon
    ```
-2. Paste the following configuration (adjust the paths to match your Pi):
-   ```ini
-   [Unit]
-   Description=WhatsApp Newspaper Bot
-   After=network.target
 
-   [Service]
-   Type=simple
-   User=pi
-   WorkingDirectory=/home/pi/whatsapp_group_scraper
-   ExecStart=/home/pi/whatsapp_group_scraper/.venv/bin/python scraper.py
-   Restart=on-failure
-   RestartSec=10
+2. **Configure `.env`** — copy `.env.example` to `.env` and fill in your values.
 
-   [Install]
-   WantedBy=multi-user.target
-   ```
-3. Enable and start the service:
+3. **Run:**
    ```bash
-   sudo systemctl enable wabot.service
-   sudo systemctl start wabot.service
-   ```
-4. Check the logs:
-   ```bash
-   sudo journalctl -u wabot.service -f
+   python scraper.py                  # Production mode
+   python scraper.py --skip-date-check  # Dev mode (bypasses daily limit)
    ```
 
 ## 📂 File Structure
 
-* `scraper.py`: The main bot logic, event listeners, and download/upload strategies.
-* `naming_utils.py`: Helper functions to translate dates and format strings into Spanish.
-* `.env`: Your private configuration file (ignored by git).
-* `last_sent.txt`: Automatically generated file tracking the date of the last successful forward.
-* `downloads/`: Automatically generated folder where PDFs are temporarily stored.
+* `scraper.py` — Main bot logic, event listeners, and download/upload strategies.
+* `naming_utils.py` — Helper to format newspaper names with Spanish dates.
+* `Dockerfile` — Container image definition.
+* `docker-compose.yml` — Standalone compose config (for running inside the project folder).
+* `.env` — Private configuration (not committed to git).
+* `last_sent.txt` — Tracks the date of the last successful forward.
+* `downloads/` — Auto-created folder where PDFs are temporarily stored.
 
 ## ⚠️ Disclaimer
 

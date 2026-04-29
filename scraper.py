@@ -26,6 +26,7 @@ TELEGRAM_SESSION_PATH = os.getenv("TELEGRAM_SESSION_PATH", "telegram_session")
 
 DOWNLOAD_PATH = "downloads"
 SENT_LOG_FILE = "last_sent.txt"
+os.makedirs(DOWNLOAD_PATH, exist_ok=True)
 
 # --- CLI ARGUMENTS ---
 parser = argparse.ArgumentParser(description="WhatsApp newspaper scraper")
