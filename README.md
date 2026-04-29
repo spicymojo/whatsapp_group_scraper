@@ -77,21 +77,37 @@ services:
 
 ### 4. First-time authentication
 
-Both WhatsApp and Telegram need a one-time interactive login:
+Both WhatsApp and Telegram need a one-time interactive login.
+
+#### Telegram session (do this first)
+
+Create the Telegram session by running a one-off interactive container:
 
 ```bash
-# Build and start the container
-docker compose up -d --build
-
-# Attach to enter auth codes
-docker attach whatsapp-newspaper
+docker compose run -it whatsapp-newspaper python -c "
+from telethon.sync import TelegramClient
+import os
+c = TelegramClient('telegram_session', int(os.environ['TELEGRAM_API_ID']), os.environ['TELEGRAM_API_HASH'])
+c.start(phone=os.environ['TELEGRAM_PHONE_NUMBER'])
+print('Session created!')
+c.disconnect()
+"
 ```
 
-1. **WhatsApp QR:** A QR code will appear in the logs. Scan it with WhatsApp → Settings → Linked Devices.
-2. **Telegram code:** When a newspaper is first detected, Telethon will ask `Please enter the code you received:`. Type the code sent to your Telegram app and press Enter.
-3. **Detach** with `Ctrl+P, Ctrl+Q` (do NOT use Ctrl+C, that stops the container).
+Enter the code Telegram sends you when prompted. The `telegram_session.session` file is saved in the volume.
 
-After this, both `session.db` and `telegram_session.session` are persisted in the volume — no need to re-authenticate unless sessions expire.
+#### WhatsApp session
+
+Start the bot and scan the QR code from the Docker logs:
+
+```bash
+docker compose up -d --build
+docker logs -f whatsapp-newspaper
+```
+
+Scan the QR code with WhatsApp → Settings → Linked Devices. The `session.db` file is saved in the volume.
+
+After both one-time auths, the sessions are persisted — no need to re-authenticate unless they expire.
 
 ### 5. Updating the code
 

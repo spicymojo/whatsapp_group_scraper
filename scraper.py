@@ -65,17 +65,16 @@ def save_sent_date():
 
 
 def _resolve_telegram_chat(tg_client):
-    """Resolve the target Telegram chat: use ID if available, otherwise search by name."""
-    if TELEGRAM_NEWSPAPERS_CHAT_ID:
-        chat_id = int(TELEGRAM_NEWSPAPERS_CHAT_ID)
-        print(f"📌 Using chat ID: {chat_id}")
-        return chat_id
+    """Resolve the target Telegram chat by searching through dialogs."""
+    target_id = int(TELEGRAM_NEWSPAPERS_CHAT_ID) if TELEGRAM_NEWSPAPERS_CHAT_ID else None
 
-    # Fallback: search by name
     for dialog in tg_client.iter_dialogs():
-        if TELEGRAM_NEWSPAPERS_CHAT_NAME in dialog.name:
+        if target_id and dialog.id == target_id:
+            print(f"📌 Found chat by ID: {dialog.name} ({dialog.id})")
+            return dialog
+        if TELEGRAM_NEWSPAPERS_CHAT_NAME and TELEGRAM_NEWSPAPERS_CHAT_NAME in dialog.name:
             print(f"📌 Found chat by name: {dialog.name} (ID: {dialog.id})")
-            return dialog.id
+            return dialog
 
     return None
 
