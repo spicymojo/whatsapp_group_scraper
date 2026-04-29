@@ -200,8 +200,25 @@ def on_connected(client: NewClient, event: ConnectedEv):
     print(f"📨 Telegram target: {TELEGRAM_NEWSPAPERS_CHAT_NAME}")
 
 
+def _ensure_telegram_session():
+    """Authenticate Telegram at startup so the code prompt works interactively."""
+    print("🔑 Checking Telegram session...")
+    tg_client = None
+    try:
+        tg_client = TelegramClient(TELEGRAM_SESSION_PATH, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+        tg_client.start(phone=TELEGRAM_PHONE_NUMBER)
+        print("✅ Telegram session ready!")
+    except Exception as e:
+        print(f"⚠️ Telegram auth failed: {e}")
+        print("   The bot will retry when a newspaper is detected.")
+    finally:
+        if tg_client:
+            tg_client.disconnect()
+
+
 if __name__ == "__main__":
     try:
+        _ensure_telegram_session()
         client.connect()
     except KeyboardInterrupt:
         print("\n👋 Shutting down safely...")
