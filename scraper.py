@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import signal
 import argparse
 from datetime import datetime, date
 from dotenv import load_dotenv
@@ -36,8 +37,14 @@ parser.add_argument(
     default=os.getenv("SKIP_DATE_CHECK", "false").lower() in ("true", "1", "yes"),
     help="Skip the once-a-day check (useful for development)"
 )
+parser.add_argument(
+    "--retry",
+    action="store_true",
+    help="Manually retry: scan recent group messages for today's newspaper"
+)
 args = parser.parse_args()
 SKIP_DATE_CHECK = args.skip_date_check
+RETRY_MODE = args.retry
 
 # --- STATE TRACKING ---
 PROCESSED_MESSAGES = set()
@@ -179,9 +186,6 @@ def on_message(client: NewClient, message: MessageEv):
                 file_name = msg_obj.documentMessage.fileName or ""
 
                 if SEARCH_TERM.lower() in file_name.lower() and msg_dt.date() == date.today():
-                    if msg_dt.hour < 7:
-                        print(f"🕒 File detected early ({msg_dt.strftime('%H:%M')}), waiting until 07:00...")
-                        return
 
                     sender = getattr(message.Info, "PushName", "Someone")
                     print(f"\n🎯 TARGET DETECTED from {sender}: {file_name}")
@@ -210,6 +214,11 @@ def on_connected(client: NewClient, event: ConnectedEv):
         print(f"   ⚠️ Could not list groups: {e}")
     print()
 
+    # If --retry flag was passed, scan recent messages for today's paper
+    if RETRY_MODE:
+        print("🔄 RETRY MODE: Scanning recent group messages...")
+        _retry_scan(client)
+
 
 def _ensure_telegram_session():
     """Authenticate Telegram at startup so the code prompt works interactively."""
@@ -227,8 +236,57 @@ def _ensure_telegram_session():
             tg_client.disconnect()
 
 
+def _retry_scan(wa_client):
+    """Manually scan recent messages from the target group for today's newspaper."""
+    global LAST_SENT_DATE
+    print("🔍 Requesting message history from the target group...")
+    try:
+        jid = build_jid(TARGET_GROUP_ID.split("@")[0], TARGET_GROUP_ID.split("@")[1])
+        messages = wa_client.get_messages(jid, 50)  # last 50 messages
+        found = False
+        for msg_info in messages:
+            try:
+                msg_obj = msg_info.Message
+                if not hasattr(msg_obj, "documentMessage") or not msg_obj.documentMessage:
+                    continue
+                file_name = msg_obj.documentMessage.fileName or ""
+                ts = msg_info.Info.Timestamp
+                if ts > 9999999999:
+                    ts /= 1000
+                msg_dt = datetime.fromtimestamp(ts)
+
+                if SEARCH_TERM.lower() in file_name.lower() and msg_dt.date() == date.today():
+                    print(f"🎯 Found today's newspaper in history: {file_name}")
+                    if download_file(wa_client, msg_info):
+                        found = True
+                        break
+            except Exception:
+                continue
+
+        if not found:
+            print("❌ No matching newspaper found in recent messages.")
+            print("   The bot will keep listening for new messages.")
+        else:
+            print("✅ Retry successful!")
+    except Exception as e:
+        print(f"⚠️ Retry scan failed: {e}")
+        print("   The bot will keep listening for new messages.")
+
+
+def _handle_retry_signal(signum, frame):
+    """Handle SIGUSR1 signal to trigger a retry scan at runtime."""
+    print("\n🔄 Received retry signal! Scanning recent messages...")
+    _retry_scan(client)
+
+
 if __name__ == "__main__":
     try:
+        # On Linux/Docker, register SIGUSR1 for runtime retry
+        if hasattr(signal, "SIGUSR1"):
+            signal.signal(signal.SIGUSR1, _handle_retry_signal)
+            print("💡 Send SIGUSR1 to trigger a retry at runtime: kill -USR1 <pid>")
+            print("   In Docker: docker exec <container> kill -USR1 1")
+
         _ensure_telegram_session()
         client.connect()
     except KeyboardInterrupt:

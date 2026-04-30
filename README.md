@@ -9,7 +9,7 @@ A robust, automated WhatsApp bot that monitors a specific group for a daily news
 * **Telegram Delivery:** Forwards the downloaded PDF to a configured Telegram chat.
 * **Resilient Downloading:** Uses a 3-tier fallback strategy (Raw Message → Pointer → Low-Level Decryption) to handle WhatsApp download issues.
 * **Daily Lockdown:** Creates a persistent `last_sent.txt` log to ensure the file is only forwarded once per day, even if the script restarts.
-* **Quiet Hours:** Ignores files sent before 7:00 AM to avoid premature triggers.
+* **Manual Retry:** Trigger a re-scan of recent messages via `--retry` flag or sending a `SIGUSR1` signal to the running process.
 * **Dev Mode:** Use `SKIP_DATE_CHECK=true` or `--skip-date-check` to bypass the once-a-day restriction during development.
 
 ## 🐳 Docker / Unraid Deployment (Recommended)
@@ -119,6 +119,27 @@ docker compose down
 docker compose up -d --build
 ```
 
+### 6. Manual Retry
+
+If the bot missed today's newspaper (e.g. a download failed), you can trigger a retry without restarting:
+
+#### Option A: Restart with `--retry` flag
+
+```bash
+docker compose down
+docker compose run whatsapp-newspaper python scraper.py --retry
+```
+
+This scans the last 50 messages in the target group for today's newspaper, processes it, and then keeps listening.
+
+#### Option B: Send a signal to the running container (no restart)
+
+```bash
+docker exec whatsapp-newspaper kill -USR1 1
+```
+
+This sends a harmless signal that tells the bot to re-scan recent messages. The bot **keeps running** — nothing is stopped or restarted.
+
 ## 💻 Local Development
 
 1. **Install dependencies:**
@@ -130,8 +151,9 @@ docker compose up -d --build
 
 3. **Run:**
    ```bash
-   python scraper.py                  # Production mode
+   python scraper.py                    # Production mode
    python scraper.py --skip-date-check  # Dev mode (bypasses daily limit)
+   python scraper.py --retry            # Retry: scan recent messages for today's paper
    ```
 
 ## 📂 File Structure
