@@ -3,6 +3,7 @@ import sys
 import time
 import signal
 import argparse
+import pytz
 from datetime import datetime, date
 from dotenv import load_dotenv
 from neonize.client import NewClient
@@ -86,8 +87,50 @@ def _resolve_telegram_chat(tg_client):
     return None
 
 
+def _pretty_print_date(dt):
+    """Format a date in Spanish like the newspapers_telegram_bot: '1 de Mayo'."""
+    months = ("Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+              "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre")
+    return f"{dt.day} de {months[dt.month - 1]}"
+
+
+def _send_day_header(tg_client, chat):
+    """Send a day marker message if none has been sent today (like newspapers_telegram_bot)."""
+    tz = pytz.timezone('Atlantic/Canary')
+    now = datetime.now(tz)
+    messages = tg_client.get_messages(chat, limit=10)
+    for msg in messages:
+        if msg.date and now.date() == msg.date.astimezone(tz).date():
+            text = getattr(msg, "message", "") or ""
+            if "#" in text:
+                print("📅 Day header already exists, skipping.")
+                return
+    header = "# " + _pretty_print_date(now)
+    tg_client.send_message(chat, header)
+    print(f"📅 Sent day header: {header}")
+
+
+def _file_already_sent_today(tg_client, chat, custom_name):
+    """Check if a file with this name was already sent to the chat today."""
+    tz = pytz.timezone('Atlantic/Canary')
+    now = datetime.now(tz)
+    messages = tg_client.get_messages(chat, limit=10)
+    for msg in messages:
+        if msg.date and now.date() == msg.date.astimezone(tz).date():
+            if msg.file and msg.file.name:
+                sent_name = msg.file.name.split(",")[0].strip()
+                if sent_name == custom_name.replace(".pdf", "").split(",")[0].strip():
+                    return True
+                # Also check exact filename match
+                if msg.file.name == custom_name:
+                    return True
+    return False
+
+
 def send_to_telegram(file_path, custom_name):
-    """Send the downloaded newspaper PDF to the Telegram newspapers chat."""
+    """Send the downloaded newspaper PDF to the Telegram newspapers chat.
+    Sends a day header if it's the first message of the day.
+    Skips sending if the file was already sent today."""
     print(f"📤 Sending '{custom_name}' to Telegram...")
     tg_client = None
     try:
@@ -98,6 +141,14 @@ def send_to_telegram(file_path, custom_name):
         if target_chat is None:
             print(f"❌ Could not find Telegram chat '{TELEGRAM_NEWSPAPERS_CHAT_NAME}'")
             return False
+
+        # Check if already sent today (avoid duplicates)
+        if _file_already_sent_today(tg_client, target_chat, custom_name):
+            print(f"✅ '{custom_name}' already sent today, skipping.")
+            return True  # Treat as success — no need to re-send
+
+        # Send day header if first message of the day
+        _send_day_header(tg_client, target_chat)
 
         tg_client.send_file(target_chat, file_path)
         print(f"🚀 Sent to Telegram successfully!")

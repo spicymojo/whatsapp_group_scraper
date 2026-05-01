@@ -7,6 +7,8 @@ A robust, automated WhatsApp bot that monitors a specific group for a daily news
 * **Targeted Monitoring:** Scans specific WhatsApp groups for files matching a keyword (e.g., "La Provincia Las Palmas").
 * **Smart Renaming:** Automatically converts raw filenames into a clean format (e.g., `La Provincia, 16 de Marzo.pdf`).
 * **Telegram Delivery:** Forwards the downloaded PDF to a configured Telegram chat.
+* **Day Header:** Automatically sends a date marker (e.g., `# 1 de Mayo`) to the Telegram chat on the first send of each day, matching the `newspapers_telegram_bot` style.
+* **Duplicate Detection:** Before sending, checks the last 10 messages in the Telegram chat — if the file was already sent today, it skips and treats it as success.
 * **Resilient Downloading:** Uses a 3-tier fallback strategy (Raw Message → Pointer → Low-Level Decryption) to handle WhatsApp download issues.
 * **Daily Lockdown:** Creates a persistent `last_sent.txt` log to ensure the file is only forwarded once per day, even if the script restarts.
 * **Manual Retry:** Trigger a re-scan of recent messages via `--retry` flag or sending a `SIGUSR1` signal to the running process.
@@ -144,7 +146,7 @@ This sends a harmless signal that tells the bot to re-scan recent messages. The 
 
 1. **Install dependencies:**
    ```bash
-   pip install neonize python-dotenv telethon
+   pip install neonize python-dotenv telethon pytz
    ```
 
 2. **Configure `.env`** — copy `.env.example` to `.env` and fill in your values.
