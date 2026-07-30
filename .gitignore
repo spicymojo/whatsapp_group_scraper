@@ -1,0 +1,21 @@
+# Environment variables
+.env
+.env.local
+
+# Session files & databases
+session.db*
+telegram_session*
+bot_session*
+*.session
+*.db
+
+# Data & Downloads
+downloads/
+last_sent.json
+last_sent.txt
+config_newspapers.json
+
+# Python cache & temp
+__pycache__/
+*.pyc
+.pytest_cache/

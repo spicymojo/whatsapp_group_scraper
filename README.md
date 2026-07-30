@@ -4,14 +4,16 @@ A robust, automated WhatsApp bot that monitors a specific group for a daily news
 
 ## ✨ Features
 
-* **Targeted Monitoring:** Scans specific WhatsApp groups for files matching a keyword (e.g., "La Provincia Las Palmas").
+* **Multi-Newspaper Monitoring:** Scans specific WhatsApp groups for multiple target newspapers (e.g. `La Provincia`, `Canarias7`, `El País`), each independently tracked.
+* **Interactive Telegram Bot Commands:** Use `/status` to check today's progress, `/list` to view active target newspapers, `/add` or `/remove` to change newspapers in real time, and `/help` for command list.
+* **Telegram QR Login Notifications:** Automatically renders WhatsApp QR authentication codes as PNG images and sends them directly to your Admin Telegram chat so you can log in without accessing container logs.
+* **Telegram Error & Disconnect Alerts:** Sends instant alert notifications to your Admin Telegram chat if WhatsApp requires re-authentication or encounters download issues.
 * **Smart Renaming:** Automatically converts raw filenames into a clean format (e.g., `La Provincia, 16 de Marzo.pdf`).
 * **Telegram Delivery:** Forwards the downloaded PDF to a configured Telegram chat.
 * **Day Header:** Automatically sends a date marker (e.g., `# 1 de Mayo`) to the Telegram chat on the first send of each day, matching the `newspapers_telegram_bot` style.
 * **Duplicate Detection:** Before sending, checks the last 10 messages in the Telegram chat — if the file was already sent today, it skips and treats it as success.
 * **Resilient Downloading:** Uses a 3-tier fallback strategy (Raw Message → Pointer → Low-Level Decryption) to handle WhatsApp download issues.
-* **Daily Lockdown:** Creates a persistent `last_sent.txt` log to ensure the file is only forwarded once per day, even if the script restarts.
-* **Manual Retry:** Trigger a re-scan of recent messages via `--retry` flag or sending a `SIGUSR1` signal to the running process.
+* **Daily Lockdown:** Tracks sent status per newspaper in a persistent `last_sent.json` log to ensure each paper is only forwarded once per day.
 * **Dev Mode:** Use `SKIP_DATE_CHECK=true` or `--skip-date-check` to bypass the once-a-day restriction during development.
 
 ## 🐳 Docker / Unraid Deployment (Recommended)
@@ -43,15 +45,25 @@ Create `.env` at the `bots/` level (or inside the project folder):
 
 ```ini
 TARGET_GROUP_ID=120363402800142448@g.us
-SEARCH_TERM=La Provincia Las Palmas
 
-# Telegram delivery config
+# Target newspapers (comma-separated search:name pairs, or JSON array)
+TARGET_NEWSPAPERS=La Provincia Las Palmas:La Provincia, Canarias7:Canarias7, El Pais:El País
+
+# Telegram Worker Account (Secondary number running the bot to upload files)
 TELEGRAM_API_ID=your_api_id
 TELEGRAM_API_HASH=your_api_hash
 TELEGRAM_PHONE_NUMBER=+34600000000
-TELEGRAM_NEWSPAPERS_CHAT_NAME=Your Chat Name
-TELEGRAM_NEWSPAPERS_CHAT_ID=1234567890
 TELEGRAM_SESSION_PATH=telegram_session
+
+# Telegram Bot Token (from @BotFather for interactive commands: /status, /list, /add, /remove)
+TELEGRAM_BOT_TOKEN=your_bot_token_from_botfather
+
+# Admin Account (Your main personal phone number or @username for QR login, error alerts)
+TELEGRAM_ADMIN_CHAT=+34684059686
+
+# Destination Channel / Group (Where daily newspaper PDFs are delivered)
+TELEGRAM_NEWSPAPERS_CHAT_NAME=Prensa de Ivaj
+TELEGRAM_NEWSPAPERS_CHAT_ID=1548654539
 
 SKIP_DATE_CHECK=false
 ```
