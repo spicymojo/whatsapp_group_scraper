@@ -590,7 +590,7 @@ def run_telegram_listener():
             async def _init_bot():
                 me = await bot_client.get_me()
                 bot_user = getattr(me, "username", "Bot")
-                print(f"🤖 Official Telegram Bot active (@{bot_user})! Send /retry, /status, or /help to @{bot_user}.")
+                print(f"🤖 Official Telegram Bot active (@{bot_user})! Send /status, /list, /add, /remove, or /help to @{bot_user}.")
 
                 @bot_client.on(events.NewMessage)
                 async def handle_bot_command(event):
@@ -683,7 +683,7 @@ def run_telegram_listener():
                 me = await tg_client.get_me()
                 me_id = getattr(me, "id", None)
 
-                print(f"🤖 Telegram bot listener active! Send /retry, /status, or /help in 'Saved Messages' or private DMs.")
+                print(f"🤖 Telegram user listener active! Send /status, /list, /add, /remove, or /help in private DMs.")
 
                 @tg_client.on(events.NewMessage)
                 async def handle_telegram_command(event):
