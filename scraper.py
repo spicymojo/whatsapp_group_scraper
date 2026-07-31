@@ -28,7 +28,13 @@ if hasattr(sys.stderr, "reconfigure"):
 load_dotenv()
 
 TARGET_GROUP_ID = os.getenv("TARGET_GROUP_ID")
+DISCONNECT_ALERT_DELAY_SECONDS = int(os.getenv("DISCONNECT_ALERT_DELAY_SECONDS", "300"))
 
+# State tracking for delayed disconnection alerts
+_wa_is_connected = False
+_disconnect_timer = None
+_disconnect_alert_sent = False
+_disconnect_lock = threading.Lock()
 
 NEWSPAPER_CONFIG_FILE = "config_newspapers.json"
 
@@ -734,6 +740,17 @@ def on_message(client: NewClient, message: MessageEv):
 
 @client.event(ConnectedEv)
 def on_connected(client: NewClient, event: ConnectedEv):
+    global _wa_is_connected, _disconnect_timer, _disconnect_alert_sent
+    with _disconnect_lock:
+        _wa_is_connected = True
+        if _disconnect_timer is not None:
+            _disconnect_timer.cancel()
+            _disconnect_timer = None
+
+        if _disconnect_alert_sent:
+            _disconnect_alert_sent = False
+            send_telegram_alert("✅ *WhatsApp Connection Restored*\nWhatsApp connection has been successfully re-established.")
+
     mode = "DEV (skip-date-check)" if SKIP_DATE_CHECK else "PRODUCTION"
     print(f"🚀 Monitoring Group: {TARGET_GROUP_ID} [{mode}]")
     print("📰 Target Newspapers:")
@@ -763,8 +780,28 @@ def on_connected(client: NewClient, event: ConnectedEv):
 
 @client.event(DisconnectedEv)
 def on_disconnected(client: NewClient, event: DisconnectedEv):
+    global _wa_is_connected, _disconnect_timer
     print("⚠️ WhatsApp disconnected!")
-    send_telegram_alert("⚠️ *WhatsApp Connection Lost*\nWhatsApp connection dropped. The scraper will attempt to reconnect automatically.")
+
+    with _disconnect_lock:
+        _wa_is_connected = False
+        if _disconnect_timer is not None:
+            _disconnect_timer.cancel()
+
+        def _delayed_alert():
+            global _disconnect_alert_sent
+            with _disconnect_lock:
+                if not _wa_is_connected:
+                    _disconnect_alert_sent = True
+                    delay_mins = DISCONNECT_ALERT_DELAY_SECONDS // 60
+                    print(f"⚠️ WhatsApp connection lost for >{delay_mins} minutes. Sending Telegram alert...")
+                    send_telegram_alert(
+                        f"⚠️ *WhatsApp Connection Lost*\nWhatsApp has been disconnected for more than {delay_mins} minutes. The scraper will attempt to reconnect automatically."
+                    )
+
+        _disconnect_timer = threading.Timer(DISCONNECT_ALERT_DELAY_SECONDS, _delayed_alert)
+        _disconnect_timer.daemon = True
+        _disconnect_timer.start()
 
 
 @client.event(LoggedOutEv)
