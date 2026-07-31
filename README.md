@@ -1,26 +1,33 @@
 # 📰 WhatsApp Group Scraper
 
-A robust, automated WhatsApp bot that monitors a specific group for a daily newspaper PDF, downloads it, renames it with a clean Spanish date format, and forwards it to a Telegram chat. Built with Python, [neonize](https://github.com/krypton-byte/neonize) (WhatsApp), and [Telethon](https://github.com/LonamiWebs/Telethon) (Telegram).
+A robust, automated WhatsApp bot that monitors a specific group for daily newspaper PDFs, downloads them, renames them with a clean Spanish date format, and forwards them to a Telegram channel. Built with Python, [neonize](https://github.com/krypton-byte/neonize) (WhatsApp), and [Telethon](https://github.com/LonamiWebs/Telethon) (Telegram).
 
 ## ✨ Features
 
-* **Multi-Newspaper Monitoring:** Scans specific WhatsApp groups for multiple target newspapers (e.g. `La Provincia`, `Canarias7`, `El País`), each independently tracked.
-* **Interactive Telegram Bot Commands:** Use `/status` to check today's progress, `/list` to view active target newspapers, `/add` or `/remove` to change newspapers in real time, and `/help` for command list.
-* **Telegram QR Login Notifications:** Automatically renders WhatsApp QR authentication codes as PNG images and sends them directly to your Admin Telegram chat so you can log in without accessing container logs.
-* **Telegram Error & Disconnect Alerts:** Sends instant alert notifications to your Admin Telegram chat if WhatsApp requires re-authentication or encounters download issues.
-* **Smart Renaming:** Automatically converts raw filenames into a clean format (e.g., `La Provincia, 16 de Marzo.pdf`).
-* **Telegram Delivery:** Forwards the downloaded PDF to a configured Telegram chat.
-* **Day Header:** Automatically sends a date marker (e.g., `# 1 de Mayo`) to the Telegram chat on the first send of each day, matching the `newspapers_telegram_bot` style.
-* **Duplicate Detection:** Before sending, checks the last 10 messages in the Telegram chat — if the file was already sent today, it skips and treats it as success.
-* **Resilient Downloading:** Uses a 3-tier fallback strategy (Raw Message → Pointer → Low-Level Decryption) to handle WhatsApp download issues.
-* **Daily Lockdown:** Tracks sent status per newspaper in a persistent `last_sent.json` log to ensure each paper is only forwarded once per day.
-* **Dev Mode:** Use `SKIP_DATE_CHECK=true` or `--skip-date-check` to bypass the once-a-day restriction during development.
+* **Multi-Newspaper & Alias Support:** Scans WhatsApp groups for multiple target newspapers (e.g. `La Provincia`, `Canarias7`, `El País`). Each newspaper supports multiple comma-separated search aliases (e.g., `La Provincia:La Provincia, La Provincia Las Palmas`).
+* **Plan B Manual Fallbacks (Telegram & WhatsApp):** If group scraping misses a paper, upload the PDF directly to `@IvajNewspapersBot` on Telegram or DM your WhatsApp account.
+  * **Telegram Plan B:** Auto-detects newspapers or presents interactive inline buttons (`[ 📰 La Provincia ]`, `[ 📰 Marca ]`) for 1-tap force matching. Features real-time download percentage progress updates.
+  * **WhatsApp Plan B:** Auto-detects newspapers or sends a numbered text selection menu (`1. La Provincia`, `2. Marca`). Simply reply `1` or `Marca` to deliver.
+* **Dual Telegram Engine Architecture:** Combines a Telegram Bot (`TELEGRAM_BOT_TOKEN`) for commands/uploads and a Telegram User Account (`TELEGRAM_PHONE_NUMBER`) for channel history inspection (`iter_messages`) and posting, bypassing Telegram Bot API history restrictions.
+* **Pre-Download Duplicate Check:** Checks `last_sent.json` and Telegram channel history *before* downloading any file bytes. If the paper was already delivered today by any bot or script, it skips downloading entirely and reports: `Already sent today, skipping.`
+* **Local Storage Auto-Cleanup:** Automatically deletes PDF files from local disk immediately after successful channel delivery to keep disk space clean.
+* **Interactive Bot Commands (Telegram & WhatsApp DM):** Works identically on both platforms:
+  * `/status` — View today's delivery status for all configured newspapers
+  * `/list` — List all active target newspapers & search aliases
+  * `/add DisplayName:alias1, alias2` — Add or update a target newspaper with aliases
+  * `/remove DisplayName` — Remove a newspaper from the active list
+  * `/help` — Display command usage and manual upload instructions
+* **Telegram QR Login & Alert Notifications:** Automatically renders WhatsApp QR authentication codes as PNG images and sends them to your Admin Telegram chat for containerless scanning. Sends instant alerts for disconnects or errors.
+* **Smart Renaming:** Automatically converts raw filenames into a clean format (e.g., `La Provincia, 31 de Julio.pdf`).
+* **Day Header:** Sends a date marker (e.g., `# 31 de Julio`) once per day, matching `newspapers_telegram_bot` style. Only sent if no header exists for today.
+* **Resilient Downloading:** Uses a 3-tier fallback strategy (Raw Message → Pointer → Low-Level Decryption) for WhatsApp downloads.
+* **Dev Mode:** Set `SKIP_DATE_CHECK=true` or pass `--skip-date-check` to bypass once-a-day restrictions during testing.
 
 ## 🐳 Docker / Unraid Deployment (Recommended)
 
 ### Folder Structure
 
-```
+```text
 /mnt/user/appdata/bots/
 ├── compose.yaml
 ├── .env                          # Shared or per-bot env config
@@ -28,6 +35,8 @@ A robust, automated WhatsApp bot that monitors a specific group for a daily news
     ├── Dockerfile
     ├── scraper.py
     ├── naming_utils.py
+    ├── config_newspapers.json    # Target newspapers & search aliases
+    ├── last_sent.json            # Persistent delivery tracking log
     ├── session.db                # Created after WhatsApp QR scan
     └── telegram_session.session  # Created after Telegram auth
 ```
@@ -41,13 +50,11 @@ git clone https://github.com/spicymojo/whatsapp_group_scraper.git
 
 ### 2. Create your `.env` file
 
-Create `.env` at the `bots/` level (or inside the project folder):
-
 ```ini
 TARGET_GROUP_ID=120363402800142448@g.us
 
-# Target newspapers (comma-separated search:name pairs, or JSON array)
-TARGET_NEWSPAPERS=La Provincia Las Palmas:La Provincia, Canarias7:Canarias7, El Pais:El País
+# Target newspapers configuration (name:alias1, alias2)
+TARGET_NEWSPAPERS=La Provincia:La Provincia, La Provincia Las Palmas; Canarias7:Canarias7; El País:El Pais, El País; Marca:Marca
 
 # Telegram Worker Account (Secondary number running the bot to upload files)
 TELEGRAM_API_ID=your_api_id
@@ -55,15 +62,15 @@ TELEGRAM_API_HASH=your_api_hash
 TELEGRAM_PHONE_NUMBER=+34600000000
 TELEGRAM_SESSION_PATH=telegram_session
 
-# Telegram Bot Token (from @BotFather for interactive commands: /status, /list, /add, /remove)
+# Telegram Bot Token (from @BotFather for interactive commands & Plan B uploads)
 TELEGRAM_BOT_TOKEN=your_bot_token_from_botfather
 
-# Admin Account (Your main personal phone number or @username for QR login, error alerts)
-TELEGRAM_ADMIN_CHAT=+34684059686
+# Admin Account (Your main personal phone number or @username for QR login & error alerts)
+TELEGRAM_ADMIN_CHAT=+34600000000
 
 # Destination Channel / Group (Where daily newspaper PDFs are delivered)
 TELEGRAM_NEWSPAPERS_CHAT_NAME=Prensa de Ivaj
-TELEGRAM_NEWSPAPERS_CHAT_ID=1548654539
+TELEGRAM_NEWSPAPERS_CHAT_ID=-1001548654539
 
 SKIP_DATE_CHECK=false
 ```
@@ -91,11 +98,7 @@ services:
 
 ### 4. First-time authentication
 
-Both WhatsApp and Telegram need a one-time interactive login.
-
 #### Telegram session (do this first)
-
-Create the Telegram session by running a one-off interactive container:
 
 ```bash
 docker compose run -it whatsapp-newspaper python -c "
@@ -108,57 +111,31 @@ c.disconnect()
 "
 ```
 
-Enter the code Telegram sends you when prompted. The `telegram_session.session` file is saved in the volume.
+Enter the code Telegram sends you when prompted.
 
 #### WhatsApp session
-
-Start the bot and scan the QR code from the Docker logs:
 
 ```bash
 docker compose up -d --build
 docker logs -f whatsapp-newspaper
 ```
 
-Scan the QR code with WhatsApp → Settings → Linked Devices. The `session.db` file is saved in the volume.
+Scan the QR code with WhatsApp → Linked Devices.
 
-After both one-time auths, the sessions are persisted — no need to re-authenticate unless they expire.
+### 5. Manual Retry / Plan B
 
-### 5. Updating the code
-
-```bash
-cd /mnt/user/appdata/bots/whatsapp_group_scraper
-git pull
-cd ..
-docker compose down
-docker compose up -d --build
-```
-
-### 6. Manual Retry
-
-If the bot missed today's newspaper (e.g. a download failed), you can trigger a retry without restarting:
-
-#### Option A: Restart with `--retry` flag
-
-```bash
-docker compose down
-docker compose run whatsapp-newspaper python scraper.py --retry
-```
-
-This scans the last 50 messages in the target group for today's newspaper, processes it, and then keeps listening.
-
-#### Option B: Send a signal to the running container (no restart)
-
-```bash
-docker exec whatsapp-newspaper kill -USR1 1
-```
-
-This sends a harmless signal that tells the bot to re-scan recent messages. The bot **keeps running** — nothing is stopped or restarted.
+* **Plan B (Telegram):** Upload any PDF directly to `@IvajNewspapersBot`.
+* **Plan B (WhatsApp):** Send any PDF directly to your WhatsApp account (DM).
+* **Runtime Retry:** Trigger a group re-scan without restarting:
+  ```bash
+  docker exec whatsapp-newspaper kill -USR1 1
+  ```
 
 ## 💻 Local Development
 
 1. **Install dependencies:**
    ```bash
-   pip install neonize python-dotenv telethon pytz
+   pip install neonize python-dotenv telethon pytz qrcode pillow
    ```
 
 2. **Configure `.env`** — copy `.env.example` to `.env` and fill in your values.
@@ -172,13 +149,13 @@ This sends a harmless signal that tells the bot to re-scan recent messages. The 
 
 ## 📂 File Structure
 
-* `scraper.py` — Main bot logic, event listeners, and download/upload strategies.
+* `scraper.py` — Main bot logic, event listeners, dual client engine, and download/upload strategies.
 * `naming_utils.py` — Helper to format newspaper names with Spanish dates.
+* `config_newspapers.json` — Persisted active newspaper names and search aliases.
+* `last_sent.json` — Persistent delivery log tracking sent dates.
 * `Dockerfile` — Container image definition.
-* `docker-compose.yml` — Standalone compose config (for running inside the project folder).
-* `.env` — Private configuration (not committed to git).
-* `last_sent.txt` — Tracks the date of the last successful forward.
-* `downloads/` — Auto-created folder where PDFs are temporarily stored.
+* `docker-compose.yml` — Compose configuration.
+* `.env` — Private configuration file.
 
 ## ⚠️ Disclaimer
 

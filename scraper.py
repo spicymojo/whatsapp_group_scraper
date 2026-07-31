@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from neonize.client import NewClient
 from neonize.events import MessageEv, ConnectedEv, DisconnectedEv, LoggedOutEv, ConnectFailureEv
 from neonize.utils import build_jid
-from telethon import events
+from telethon import events, Button
 from telethon.sync import TelegramClient
 from naming_utils import get_newspaper_name
 
@@ -43,6 +43,29 @@ def save_target_newspapers(newspapers_list):
         print(f"⚠️ Failed to save newspaper config: {e}")
 
 
+def get_search_aliases(np_entry: dict) -> list:
+    """Returns a list of search term aliases for a newspaper entry, with surrounding whitespace stripped."""
+    search_val = np_entry.get("search", "")
+    if isinstance(search_val, (list, tuple)):
+        return [str(s).strip() for s in search_val if str(s).strip()]
+    return [s.strip() for s in str(search_val).split(",") if s.strip()]
+
+
+def matches_newspaper(text: str, np_entry: dict) -> bool:
+    """Checks if any search alias or display name matches the input text (case-insensitive and trimmed)."""
+    if not text or not np_entry:
+        return False
+    text_lower = text.strip().lower()
+    name_clean = np_entry.get("name", "").strip().lower()
+    if name_clean and name_clean in text_lower:
+        return True
+    for alias in get_search_aliases(np_entry):
+        alias_clean = alias.strip().lower()
+        if alias_clean and alias_clean in text_lower:
+            return True
+    return False
+
+
 def load_target_newspapers():
     """Load target newspapers configuration from config_newspapers.json or environment variables."""
     if os.path.exists(NEWSPAPER_CONFIG_FILE):
@@ -62,27 +85,28 @@ def load_target_newspapers():
             try:
                 items = json.loads(env_val)
                 for item in items:
-                    if isinstance(item, dict) and "search" in item:
+                    if isinstance(item, dict) and "name" in item:
                         res.append({
-                            "search": str(item["search"]).strip(),
-                            "name": str(item.get("name", item["search"])).strip()
+                            "name": str(item["name"]).strip(),
+                            "search": str(item.get("search", item["name"])).strip()
                         })
             except json.JSONDecodeError:
                 pass
         if not res:
-            for part in env_val.split(","):
+            raw_items = env_val.replace("\n", ";").split(";")
+            for part in raw_items:
                 part = part.strip()
                 if not part:
                     continue
                 if ":" in part:
-                    search_term, name = part.split(":", 1)
-                    res.append({"search": search_term.strip(), "name": name.strip()})
+                    name_part, search_part = part.split(":", 1)
+                    res.append({"name": name_part.strip(), "search": search_part.strip()})
                 else:
-                    res.append({"search": part, "name": part})
+                    res.append({"name": part, "search": part})
 
     if not res:
         legacy_search = os.getenv("SEARCH_TERM", "La Provincia Las Palmas").strip()
-        res = [{"search": legacy_search, "name": "La Provincia"}]
+        res = [{"name": "La Provincia", "search": f"La Provincia, {legacy_search}"}]
 
     save_target_newspapers(res)
     return res
@@ -165,21 +189,49 @@ def save_sent_date(newspaper_name: str):
     return today_str
 
 
-TG_CLIENT = None
+TG_BOT_CLIENT = None
+TG_USER_CLIENT = None
 TG_LOOP = None
 TG_LOCK = threading.Lock()
 
 
 def _ensure_tg_initialized():
-    """Ensure a single shared TelegramClient instance and event loop exist."""
-    global TG_CLIENT, TG_LOOP
+    """Ensure Telegram clients (Bot and User Account) exist on a single shared event loop."""
+    global TG_BOT_CLIENT, TG_USER_CLIENT, TG_LOOP, TG_CLIENT
     with TG_LOCK:
-        if TG_CLIENT is None:
+        if TG_LOOP is None:
             TG_LOOP = asyncio.new_event_loop()
             asyncio.set_event_loop(TG_LOOP)
-            tg_client = TelegramClient(TELEGRAM_SESSION_PATH, TELEGRAM_API_ID, TELEGRAM_API_HASH, loop=TG_LOOP)
-            tg_client.start(phone=TELEGRAM_PHONE_NUMBER)
-            TG_CLIENT = tg_client
+
+        # 1. Initialize Bot Client for commands & Plan B uploads if bot token exists
+        if TG_BOT_CLIENT is None and TELEGRAM_BOT_TOKEN:
+            try:
+                bot_c = TelegramClient("bot_session", TELEGRAM_API_ID, TELEGRAM_API_HASH, loop=TG_LOOP)
+                bot_c.start(bot_token=TELEGRAM_BOT_TOKEN)
+                TG_BOT_CLIENT = bot_c
+                print("🤖 Telegram Bot Client ready!")
+            except Exception as e:
+                print(f"⚠️ Could not start Telegram Bot Client: {e}")
+
+        # 2. Initialize User Client for channel history & user posting if phone exists
+        if TG_USER_CLIENT is None and TELEGRAM_PHONE_NUMBER:
+            try:
+                user_c = TelegramClient(TELEGRAM_SESSION_PATH, TELEGRAM_API_ID, TELEGRAM_API_HASH, loop=TG_LOOP)
+                def _code_callback():
+                    if not sys.stdin.isatty():
+                        raise RuntimeError(
+                            "Telegram user session is not authorized and standard input is non-interactive. "
+                            "Please run interactive login to authorize the session."
+                        )
+                    return input("Please enter the code you received: ")
+                user_c.start(phone=TELEGRAM_PHONE_NUMBER, code_callback=_code_callback)
+                TG_USER_CLIENT = user_c
+                print("📱 Telegram User Account Client ready!")
+            except Exception as e:
+                print(f"⚠️ Could not start Telegram User Client: {e}")
+
+        # Primary client for history and channel sending: User Client first, fallback to Bot Client
+        TG_CLIENT = TG_USER_CLIENT or TG_BOT_CLIENT
     return TG_CLIENT, TG_LOOP
 
 
@@ -192,43 +244,41 @@ async def _resolve_telegram_chat(tg_client):
         print("📌 Target chat set to 'me' (Saved Messages).")
         return "me"
 
-    raw_target = TELEGRAM_NEWSPAPERS_CHAT_ID or TELEGRAM_NEWSPAPERS_CHAT_NAME
-    raw_str = str(raw_target).strip()
+    # 1. Try username format (@channelname)
+    for raw in [TELEGRAM_NEWSPAPERS_CHAT_NAME, TELEGRAM_NEWSPAPERS_CHAT_ID]:
+        if raw and str(raw).strip().startswith("@"):
+            try:
+                entity = await tg_client.get_entity(str(raw).strip())
+                if entity:
+                    print(f"📌 Found target channel by username: {raw}")
+                    return entity
+            except Exception:
+                pass
 
-    # Try resolving phone number format (+34... or 34...)
-    if raw_str.startswith("+") or (raw_str.isdigit() and len(raw_str) >= 11):
-        phone_fmt = raw_str if raw_str.startswith("+") else f"+{raw_str}"
-        try:
-            entity = await tg_client.get_entity(phone_fmt)
-            if entity:
-                name = getattr(entity, "first_name", getattr(entity, "title", phone_fmt))
-                print(f"📌 Found target recipient by phone: {name} ({phone_fmt})")
-                return entity
-        except Exception:
-            pass
-
-    # Try integer chat ID
+    # 2. Try integer chat ID candidates (raw ID, -100 channel ID, - group ID)
     if id_str.lstrip("-").isdigit():
-        target_id = int(TELEGRAM_NEWSPAPERS_CHAT_ID)
-        async for dialog in tg_client.iter_dialogs():
-            if dialog.id == target_id or dialog.id == int(f"-100{target_id}") or dialog.id == -target_id:
-                print(f"📌 Found chat by ID: {dialog.name} ({dialog.id})")
-                return dialog
-        try:
-            entity = await tg_client.get_entity(target_id)
-            if entity:
-                return entity
-        except Exception:
-            pass
+        raw_id = int(TELEGRAM_NEWSPAPERS_CHAT_ID)
+        candidates = [raw_id]
+        if raw_id > 0:
+            candidates.append(int(f"-100{raw_id}"))
+            candidates.append(-raw_id)
 
-    # Try dialog name
-    if TELEGRAM_NEWSPAPERS_CHAT_NAME:
-        async for dialog in tg_client.iter_dialogs():
-            if TELEGRAM_NEWSPAPERS_CHAT_NAME in dialog.name:
-                print(f"📌 Found chat by name: {dialog.name} (ID: {dialog.id})")
-                return dialog
+        for cid in candidates:
+            try:
+                entity = await tg_client.get_entity(cid)
+                if entity:
+                    print(f"📌 Resolved Telegram target chat ID: {cid}")
+                    return entity
+            except Exception:
+                pass
 
-    print(f"⚠️ Target chat '{raw_str}' not found. Falling back to 'Saved Messages' (me).")
+    # 3. Fallback to channel ID integer
+    if id_str.lstrip("-").isdigit():
+        raw_id = int(TELEGRAM_NEWSPAPERS_CHAT_ID)
+        target = int(f"-100{raw_id}") if raw_id > 0 else raw_id
+        return target
+
+    print(f"⚠️ Target chat '{TELEGRAM_NEWSPAPERS_CHAT_NAME or TELEGRAM_NEWSPAPERS_CHAT_ID}' not found. Falling back to 'me'.")
     return "me"
 
 
@@ -240,39 +290,75 @@ def _pretty_print_date(dt):
 
 
 async def _send_day_header(tg_client, chat):
-    """Send a day marker message if none has been sent today (like newspapers_telegram_bot)."""
+    """Send a day marker message if none has been sent today."""
     tz = pytz.timezone('Atlantic/Canary')
     now = datetime.now(tz)
-    messages = await tg_client.get_messages(chat, limit=10)
-    for msg in messages:
-        if msg.date and now.date() == msg.date.astimezone(tz).date():
-            text = getattr(msg, "message", "") or ""
-            if "#" in text:
-                print("📅 Day header already exists, skipping.")
-                return
-    header = "# " + _pretty_print_date(now)
-    await tg_client.send_message(chat, header)
-    print(f"📅 Sent day header: {header}")
+
+    # 1. Local persistent tracking check
+    if not SKIP_DATE_CHECK and already_sent_today("__DAY_HEADER__"):
+        print("📅 Day header already sent today (local log), skipping.")
+        return
+
+    # 2. Check channel history for header (#)
+    try:
+        async for msg in tg_client.iter_messages(chat, limit=25):
+            if msg and msg.date:
+                msg_date = msg.date.astimezone(tz).date()
+                if msg_date == now.date():
+                    text = getattr(msg, "message", "") or getattr(msg, "text", "") or ""
+                    if "#" in text:
+                        print("📅 Day header already exists in channel today (from channel history), skipping.")
+                        save_sent_date("__DAY_HEADER__")
+                        return
+    except Exception:
+        pass
+
+    try:
+        header = "# " + _pretty_print_date(now)
+        await tg_client.send_message(chat, header)
+        save_sent_date("__DAY_HEADER__")
+        print(f"📅 Sent day header: {header}")
+    except Exception as e:
+        print(f"💡 Note: Day header skipped ({e}).")
 
 
 async def _file_already_sent_today(tg_client, chat, custom_name):
     """Check if a file with this name was already sent to the chat today."""
-    tz = pytz.timezone('Atlantic/Canary')
-    now = datetime.now(tz)
-    messages = await tg_client.get_messages(chat, limit=10)
-    for msg in messages:
-        if msg.date and now.date() == msg.date.astimezone(tz).date():
-            if msg.file and msg.file.name:
-                sent_name = msg.file.name.split(",")[0].strip()
-                if sent_name == custom_name.replace(".pdf", "").split(",")[0].strip():
-                    return True
-                # Also check exact filename match
-                if msg.file.name == custom_name:
-                    return True
+    if SKIP_DATE_CHECK:
+        return False
+
+    newspaper_name = custom_name.split(",")[0].strip()
+
+    # 1. Check local persistent tracking (last_sent.json)
+    if already_sent_today(newspaper_name):
+        print(f"✅ '{newspaper_name}' is already recorded as sent today in last_sent.json.")
+        return True
+
+    # 2. Inspect channel history (file names + message text captions)
+    try:
+        tz = pytz.timezone('Atlantic/Canary')
+        now = datetime.now(tz)
+        target_clean = custom_name.replace(".pdf", "").split(",")[0].strip().lower()
+
+        async for msg in tg_client.iter_messages(chat, limit=30):
+            if msg and msg.date:
+                msg_date = msg.date.astimezone(tz).date()
+                if msg_date == now.date():
+                    file_name = getattr(msg.file, "name", "") if msg.file else ""
+                    msg_text = getattr(msg, "message", "") or getattr(msg, "text", "") or ""
+                    haystack = f"{file_name} {msg_text}".lower()
+
+                    if target_clean in haystack:
+                        print(f"✅ '{newspaper_name}' detected in Telegram channel history for today.")
+                        save_sent_date(newspaper_name)
+                        return True
+    except Exception as ex:
+        print(f"💡 Note: Channel history check skipped ({ex}).")
+
     return False
 
 
-def send_to_telegram(file_path, custom_name):
+def send_to_telegram(file_path, custom_name, is_manual: bool = False):
     """Send the downloaded newspaper PDF to the Telegram newspapers chat."""
     print(f"📤 Sending '{custom_name}' to Telegram...")
     try:
@@ -284,8 +370,8 @@ def send_to_telegram(file_path, custom_name):
                 print(f"❌ Could not find Telegram chat '{TELEGRAM_NEWSPAPERS_CHAT_NAME}'")
                 return False
 
-            if await _file_already_sent_today(tg_client, target_chat, custom_name):
-                print(f"✅ '{custom_name}' already sent today, skipping.")
+            if not SKIP_DATE_CHECK and await _file_already_sent_today(tg_client, target_chat, custom_name):
+                print(f"✅ '{custom_name}' already sent today, skipping duplicate delivery.")
                 return True
 
             await _send_day_header(tg_client, target_chat)
@@ -381,7 +467,11 @@ def on_qr(client: NewClient, qr_data: bytes):
         print(f"⚠️ Failed to process/send WhatsApp QR code to Telegram: {e}")
 
 
-def download_file(client, message_ev, newspaper_name: str):
+def download_file(client, message_ev, newspaper_name: str, is_manual: bool = False):
+    if not is_manual and not SKIP_DATE_CHECK and already_sent_today(newspaper_name):
+        print(f"✅ '{newspaper_name}' has already been sent today, skipping download.")
+        return True
+
     doc = message_ev.Message.documentMessage
     ts = message_ev.Info.Timestamp
     if ts > 9999999999: ts /= 1000
@@ -392,8 +482,11 @@ def download_file(client, message_ev, newspaper_name: str):
 
     if os.path.exists(path) and os.path.getsize(path) > 0:
         print(f"📦 File already exists locally ({custom_name}). Attempting to send...")
-        if send_to_telegram(path, custom_name):
+        if send_to_telegram(path, custom_name, is_manual=is_manual):
             save_sent_date(newspaper_name)
+            if os.path.exists(path):
+                try: os.remove(path)
+                except Exception: pass
             return True
 
     for cycle in range(1, 4):
@@ -416,8 +509,13 @@ def download_file(client, message_ev, newspaper_name: str):
                         f.write(data)
                     print(f"✅ Download successful via Strategy {name}.")
 
-                    if send_to_telegram(path, custom_name):
+                    if send_to_telegram(path, custom_name, is_manual=is_manual):
                         save_sent_date(newspaper_name)
+                        if os.path.exists(path):
+                            try:
+                                os.remove(path)
+                                print(f"🧹 Cleaned up local temp file '{custom_name}'.")
+                            except Exception: pass
                         return True
                     else:
                         if os.path.exists(path): os.remove(path)
@@ -433,13 +531,99 @@ def download_file(client, message_ev, newspaper_name: str):
     return False
 
 
+PENDING_WA_SELECTIONS = {}
+
+
+def _send_wa_reply(client: NewClient, message_ev: MessageEv, text: str):
+    """Helper to send a text reply back to the chat on WhatsApp using neonize."""
+    try:
+        chat_jid = message_ev.Info.MessageSource.Chat
+        client.send_message(chat_jid, text)
+    except Exception as e:
+        print(f"⚠️ Failed to send WhatsApp reply: {e}")
+
+
+def process_bot_command(text: str) -> str:
+    """Processes bot commands (/status, /list, /add, /remove, /help, /start) and returns the formatted response string."""
+    text = text.strip()
+    if not text.startswith("/"):
+        return None
+
+    cmd_parts = text.split(maxsplit=1)
+    cmd = cmd_parts[0].lower().split("@")[0]
+    arg = cmd_parts[1].strip() if len(cmd_parts) > 1 else ""
+
+    if cmd == "/status":
+        status_lines = ["📊 *Today's Newspaper Status*:"]
+        for np in TARGET_NEWSPAPERS:
+            st = "✅ Completed" if already_sent_today(np["name"]) else "⏳ Pending"
+            status_lines.append(f"• *{np['name']}*: {st}")
+        mode = "DEV (skip-date-check)" if SKIP_DATE_CHECK else "PRODUCTION"
+        status_lines.append(f"\n⚙️ Mode: `{mode}`")
+        return "\n".join(status_lines)
+
+    elif cmd == "/list":
+        if not TARGET_NEWSPAPERS:
+            return "📰 No newspapers are currently configured."
+        lines = ["📰 *Configured Target Newspapers*:"]
+        for i, np in enumerate(TARGET_NEWSPAPERS, 1):
+            st = " (Completed today)" if already_sent_today(np["name"]) else " (Pending)"
+            aliases = ", ".join(f"`{a}`" for a in get_search_aliases(np))
+            lines.append(f"{i}. *{np['name']}*{st}\n   • Search aliases: {aliases}")
+        lines.append("\n💡 *Usage*: `/add Name:search1, search2` or `/remove Name`")
+        return "\n".join(lines)
+
+    elif cmd == "/add":
+        if not arg:
+            return "⚠️ *Usage*: `/add DisplayName:search1, search2`\nExample: `/add La Provincia:La Provincia, La Provincia Las Palmas`"
+        if ":" in arg:
+            p_name, p_search = arg.split(":", 1)
+            display_name, search_terms = p_name.strip(), p_search.strip()
+        else:
+            display_name, search_terms = arg.strip(), arg.strip()
+
+        existing = next((np for np in TARGET_NEWSPAPERS if np["name"].lower() == display_name.lower()), None)
+        if existing:
+            existing["search"] = search_terms
+            save_target_newspapers(TARGET_NEWSPAPERS)
+            aliases_str = ", ".join(f"`{a}`" for a in get_search_aliases(existing))
+            return f"✏️ Updated newspaper *{display_name}*\nSearch aliases: {aliases_str}"
+        else:
+            new_np = {"name": display_name, "search": search_terms}
+            TARGET_NEWSPAPERS.append(new_np)
+            save_target_newspapers(TARGET_NEWSPAPERS)
+            aliases_str = ", ".join(f"`{a}`" for a in get_search_aliases(new_np))
+            return f"✅ Added newspaper *{display_name}*\nSearch aliases: {aliases_str}"
+
+    elif cmd == "/remove":
+        if not arg:
+            return "⚠️ *Usage*: `/remove DisplayName`\nExample: `/remove Canarias7`"
+        target = arg.lower()
+        matching = [np for np in TARGET_NEWSPAPERS if np["name"].lower() == target or np["search"].lower() == target]
+        if not matching:
+            return f"❌ Newspaper *{arg}* not found in active list.\nUse `/list` to view active newspapers."
+        for np in matching:
+            TARGET_NEWSPAPERS.remove(np)
+        save_target_newspapers(TARGET_NEWSPAPERS)
+        return f"🗑️ Removed *{arg}* from target newspapers list."
+
+    elif cmd in ("/help", "/start"):
+        return (
+            "🤖 *Newspaper Scraper Commands*:\n\n"
+            "• `/status` - Show today's delivery status for all newspapers\n"
+            "• `/list` - List all active target newspapers\n"
+            "• `/add SearchTerm:DisplayName` - Add or update a target newspaper\n"
+            "• `/remove DisplayName` - Remove a newspaper from the list\n"
+            "• `/help` - Show this help message\n\n"
+            "📄 *Plan B*: Upload a PDF directly to this chat to forward it to your Telegram channel!"
+        )
+
+    return None
+
+
 @client.event(MessageEv)
 def on_message(client: NewClient, message: MessageEv):
     try:
-        # Stop processing if all target newspapers have already been sent today
-        if not SKIP_DATE_CHECK and all(already_sent_today(np["name"]) for np in TARGET_NEWSPAPERS):
-            return
-
         msg_id = message.Info.ID
         if msg_id in PROCESSED_MESSAGES: return
         PROCESSED_MESSAGES.add(msg_id)
@@ -450,20 +634,100 @@ def on_message(client: NewClient, message: MessageEv):
         ts = message.Info.Timestamp
         if ts > 9999999999: ts /= 1000
         msg_dt = datetime.fromtimestamp(ts)
+        msg_obj = message.Message
 
+        # 1. Target Group Scraping
         if current_chat_id == TARGET_GROUP_ID:
-            msg_obj = message.Message
-            if hasattr(msg_obj, "documentMessage"):
+            if hasattr(msg_obj, "documentMessage") and msg_obj.documentMessage:
                 file_name = msg_obj.documentMessage.fileName or ""
 
                 for np in TARGET_NEWSPAPERS:
-                    if already_sent_today(np["name"]):
+                    if not SKIP_DATE_CHECK and already_sent_today(np["name"]):
                         continue
-                    if np["search"].lower() in file_name.lower() and msg_dt.date() == date.today():
+                    if matches_newspaper(file_name, np) and (SKIP_DATE_CHECK or msg_dt.date() == date.today()):
                         sender = getattr(message.Info, "PushName", "Someone")
                         print(f"\n🎯 TARGET DETECTED [{np['name']}] from {sender}: {file_name}")
-                        download_file(client, message, np["name"])
+                        download_file(client, message, np["name"], is_manual=False)
                         break
+
+        # 2. Plan B: Direct WhatsApp DM / Manual Upload / Commands
+        elif chat_info.Server != "g.us" or current_chat_id != TARGET_GROUP_ID:
+            # Check for bot commands in WhatsApp DM (/status, /list, /add, /remove, /help)
+            text_content = ""
+            if hasattr(msg_obj, "conversation") and msg_obj.conversation:
+                text_content = msg_obj.conversation.strip()
+            elif hasattr(msg_obj, "extendedTextMessage") and msg_obj.extendedTextMessage:
+                text_content = (msg_obj.extendedTextMessage.text or "").strip()
+
+            if text_content and text_content.startswith("/"):
+                cmd_reply = process_bot_command(text_content)
+                if cmd_reply:
+                    _send_wa_reply(client, message, cmd_reply)
+                    return
+
+            # Check if this is a pending text reply to a previous selection prompt
+            if current_chat_id in PENDING_WA_SELECTIONS:
+                if text_content:
+                    matched_np = None
+                    if text_content.isdigit():
+                        idx = int(text_content) - 1
+                        if 0 <= idx < len(TARGET_NEWSPAPERS):
+                            matched_np = TARGET_NEWSPAPERS[idx]
+                    else:
+                        for np in TARGET_NEWSPAPERS:
+                            if matches_newspaper(text_content, np):
+                                matched_np = np
+                                break
+
+                    if matched_np:
+                        saved_ev = PENDING_WA_SELECTIONS.pop(current_chat_id)
+                        if not SKIP_DATE_CHECK and already_sent_today(matched_np["name"]):
+                            print(f"✅ Plan B WhatsApp: '{matched_np['name']}' was already sent today. Skipping download.")
+                            _send_wa_reply(client, message, f"⚠️ *Plan B WhatsApp*: `{matched_np['name']}` has already been delivered today! Skipping download.")
+                            return
+
+                        print(f"🎯 Plan B WhatsApp: Selected [{matched_np['name']}] via text reply.")
+                        _send_wa_reply(client, message, f"⏳ *Plan B WhatsApp*: Processing as `{matched_np['name']}`...")
+                        if download_file(client, saved_ev, matched_np["name"], is_manual=True):
+                            _send_wa_reply(client, message, f"✅ *Plan B WhatsApp Success*: Delivered `{matched_np['name']}` to Telegram!")
+                        else:
+                            _send_wa_reply(client, message, f"❌ *Plan B WhatsApp Error*: Failed to process `{matched_np['name']}`.")
+                        return
+                    else:
+                        _send_wa_reply(client, message, "⚠️ Invalid choice. Please reply with the number (e.g. 1) or newspaper name.")
+                        return
+
+            # Check if user sent a PDF document directly
+            if hasattr(msg_obj, "documentMessage") and msg_obj.documentMessage:
+                file_name = msg_obj.documentMessage.fileName or ""
+                print(f"\n📩 Plan B WhatsApp: Received direct document upload '{file_name}'")
+
+                matched_np = None
+                for np in TARGET_NEWSPAPERS:
+                    if matches_newspaper(file_name, np):
+                        matched_np = np
+                        break
+
+                if matched_np:
+                    if not SKIP_DATE_CHECK and already_sent_today(matched_np["name"]):
+                        print(f"✅ Plan B WhatsApp: '{matched_np['name']}' was already sent today. Skipping download.")
+                        _send_wa_reply(client, message, f"⚠️ *Plan B WhatsApp*: `{matched_np['name']}` has already been delivered today! Skipping download.")
+                        return
+
+                    print(f"🎯 Plan B WhatsApp: Auto-matched [{matched_np['name']}] for '{file_name}'")
+                    _send_wa_reply(client, message, f"⏳ *Plan B WhatsApp*: Auto-matched `{matched_np['name']}`. Downloading & forwarding...")
+                    if download_file(client, message, matched_np["name"], is_manual=True):
+                        _send_wa_reply(client, message, f"✅ *Plan B WhatsApp Success*: Delivered `{matched_np['name']}` to Telegram!")
+                    else:
+                        _send_wa_reply(client, message, f"❌ *Plan B WhatsApp Error*: Failed to process `{matched_np['name']}`.")
+                else:
+                    PENDING_WA_SELECTIONS[current_chat_id] = message
+                    lines = [f"⚠️ *Plan B WhatsApp*: Could not auto-detect newspaper for `{file_name}`.\n\nPlease reply with the number or name of the newspaper:"]
+                    for i, np in enumerate(TARGET_NEWSPAPERS, 1):
+                        aliases = ", ".join(get_search_aliases(np))
+                        lines.append(f"{i}. *{np['name']}* (Aliases: `{aliases}`)")
+                    lines.append("\n💡 Example reply: `1` or `Marca`")
+                    _send_wa_reply(client, message, "\n".join(lines))
     except Exception as e:
         print(f"⚠️ Error in on_message: {e}")
 
@@ -475,7 +739,8 @@ def on_connected(client: NewClient, event: ConnectedEv):
     print("📰 Target Newspapers:")
     for np in TARGET_NEWSPAPERS:
         status = "Completed" if already_sent_today(np["name"]) else "Pending"
-        print(f"   • {np['name']} (Search: '{np['search']}') → {status}")
+        aliases = ", ".join(get_search_aliases(np))
+        print(f"   • {np['name']} (Aliases: '{aliases}') → {status}")
     print(f"📨 Telegram target: {TELEGRAM_NEWSPAPERS_CHAT_NAME}")
 
     # Log all groups to help discover group IDs
@@ -551,7 +816,7 @@ def _retry_scan(wa_client):
                     continue
 
                 for np in list(pending_nps):
-                    if np["search"].lower() in file_name.lower():
+                    if matches_newspaper(file_name, np):
                         print(f"🎯 Found today's newspaper [{np['name']}] in history: {file_name}")
                         if download_file(wa_client, msg_info, np["name"]):
                             pending_nps.remove(np)
@@ -578,195 +843,214 @@ def _handle_retry_signal(signum, frame):
 
 def run_telegram_listener():
     """Run Telegram command listener in a background daemon thread.
-    Uses official Bot API (TELEGRAM_BOT_TOKEN) if set, or falls back to User Account listener."""
-    if TELEGRAM_BOT_TOKEN:
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+    Uses the unified TG_CLIENT instance (Bot API or User account)."""
+    try:
+        tg_client, loop = _ensure_tg_initialized()
+        asyncio.set_event_loop(loop)
 
-            bot_client = TelegramClient("bot_session", TELEGRAM_API_ID, TELEGRAM_API_HASH, loop=loop)
-            bot_client.start(bot_token=TELEGRAM_BOT_TOKEN)
+        async def _init_and_run():
+            me = await tg_client.get_me()
+            is_bot = getattr(me, "bot", False)
+            username = getattr(me, "username", "Bot" if is_bot else "User")
 
-            async def _init_bot():
-                me = await bot_client.get_me()
-                bot_user = getattr(me, "username", "Bot")
-                print(f"🤖 Official Telegram Bot active (@{bot_user})! Send /status, /list, /add, /remove, or /help to @{bot_user}.")
+            if is_bot:
+                print(f"🤖 Official Telegram Bot active (@{username})! Send /status, /list, /add, /remove, or /help to @{username}.")
+            else:
+                print(f"🤖 Telegram listener active (@{username})! Send /status, /list, /add, /remove, or /help in private DMs.")
 
-                @bot_client.on(events.NewMessage)
-                async def handle_bot_command(event):
-                    text = (event.raw_text or "").strip()
-                    if not text.startswith("/"):
+            async def _process_uploaded_telegram_document(event):
+                """Process a PDF/document sent directly to the Telegram bot as Plan B fallback."""
+                file = event.message.file
+                if not file:
+                    return
+
+                orig_name = file.name or ""
+                caption_text = (event.raw_text or "").strip()
+                search_haystack = f"{orig_name} {caption_text}".lower()
+
+                # Find matching target newspaper automatically
+                matched_np = None
+                for np in TARGET_NEWSPAPERS:
+                    if matches_newspaper(search_haystack, np):
+                        matched_np = np
+                        break
+
+                # If no auto-match, prompt with interactive inline buttons to select newspaper
+                if not matched_np:
+                    buttons = []
+                    for idx, np in enumerate(TARGET_NEWSPAPERS):
+                        buttons.append([Button.inline(f"📰 {np['name']} (Search: '{np['search']}')", data=f"select_np:{idx}:{event.message.id}")])
+
+                    await event.reply(
+                        f"⚠️ *Plan B Upload*: Could not auto-detect newspaper for `{orig_name}`.\n\n"
+                        f"👇 *Please tap the newspaper this file belongs to*:",
+                        buttons=buttons
+                    )
+                    return
+
+                newspaper_name = matched_np["name"]
+                msg_dt = event.message.date or datetime.now()
+                custom_name = get_newspaper_name(newspaper_name, msg_dt)
+                save_path = os.path.join(DOWNLOAD_PATH, custom_name)
+
+                target_chat = await _resolve_telegram_chat(tg_client)
+                if target_chat and not SKIP_DATE_CHECK and await _file_already_sent_today(tg_client, target_chat, custom_name):
+                    print(f"✅ Plan B: '{newspaper_name}' was already sent today. Skipping download.")
+                    await event.reply(f"⚠️ *Plan B*: `{newspaper_name}` has already been delivered today! Skipping download.")
+                    return
+
+                status_msg = await event.reply(f"⏳ *Plan B Activated*: Downloading `{custom_name}`...")
+
+                try:
+                    last_edit = [0]
+                    async def dl_progress(current, total):
+                        now = time.time()
+                        if total > 0 and (now - last_edit[0] >= 30.0 or current == total):
+                            last_edit[0] = now
+                            pct = int((current / total) * 100)
+                            mb_cur = current / (1024 * 1024)
+                            mb_tot = total / (1024 * 1024)
+                            try:
+                                await status_msg.edit(f"⏳ *Downloading*: `{custom_name}`\n📊 *Progress*: `{pct}%` ({mb_cur:.1f} / {mb_tot:.1f} MB)")
+                            except Exception:
+                                pass
+
+                    await tg_client.download_media(event.message, file=save_path, progress_callback=dl_progress)
+                    print(f"✅ Plan B: Downloaded '{custom_name}' directly from Telegram upload.")
+
+                    target_chat = await _resolve_telegram_chat(tg_client)
+                    if target_chat is None:
+                        await status_msg.edit(f"❌ Could not resolve Telegram channel `{TELEGRAM_NEWSPAPERS_CHAT_NAME}`.")
                         return
 
-                    cmd = text.split()[0].lower().split("@")[0]
-                    if cmd == "/status":
-                        status_lines = ["📊 *Today's Newspaper Status*:"]
-                        for np in TARGET_NEWSPAPERS:
-                            st = "✅ Completed" if already_sent_today(np["name"]) else "⏳ Pending"
-                            status_lines.append(f"• *{np['name']}*: {st}")
-                        mode = "DEV (skip-date-check)" if SKIP_DATE_CHECK else "PRODUCTION"
-                        status_lines.append(f"\n⚙️ Mode: `{mode}`")
-                        await event.reply("\n".join(status_lines))
+                    await status_msg.edit(f"📤 *Uploading to Channel*: `{custom_name}`...")
+                    await _send_day_header(tg_client, target_chat)
+                    await tg_client.send_file(target_chat, save_path)
+                    save_sent_date(newspaper_name)
+                    print(f"🚀 Plan B: Sent '{custom_name}' to Telegram channel successfully!")
 
-                    elif cmd == "/list":
-                        if not TARGET_NEWSPAPERS:
-                            await event.reply("📰 No newspapers are currently configured.")
-                        else:
-                            lines = ["📰 *Configured Target Newspapers*:"]
-                            for i, np in enumerate(TARGET_NEWSPAPERS, 1):
-                                st = " (Completed today)" if already_sent_today(np["name"]) else " (Pending)"
-                                lines.append(f"{i}. *{np['name']}*{st}\n   • Search term: `{np['search']}`")
-                            lines.append("\n💡 *Commands*: `/add Search:Name` or `/remove Name`")
-                            await event.reply("\n".join(lines))
+                    if os.path.exists(save_path):
+                        try:
+                            os.remove(save_path)
+                            print(f"🧹 Cleaned up local file '{custom_name}'.")
+                        except Exception: pass
 
-                    elif cmd == "/add":
-                        raw_arg = text.split(" ", 1)[1].strip() if " " in text else ""
-                        if not raw_arg:
-                            await event.reply("⚠️ *Usage*: `/add SearchTerm:DisplayName`\nExample: `/add El Pais:El País`")
-                        else:
-                            if ":" in raw_arg:
-                                p_search, p_name = raw_arg.split(":", 1)
-                                search_term, display_name = p_search.strip(), p_name.strip()
-                            else:
-                                search_term, display_name = raw_arg.strip(), raw_arg.strip()
+                    target_display = TELEGRAM_NEWSPAPERS_CHAT_NAME or TELEGRAM_NEWSPAPERS_CHAT_ID or "Target Channel"
+                    await status_msg.edit(
+                        f"✅ *Plan B Success*!\n\n"
+                        f"📰 *Newspaper*: *{newspaper_name}*\n"
+                        f"📄 *File*: `{custom_name}`\n"
+                        f"📨 Delivered to `{target_display}`."
+                    )
+                except Exception as e:
+                    print(f"❌ Plan B failed: {e}")
+                    await status_msg.edit(f"❌ *Plan B Error*: Failed to process `{custom_name}`: {e}")
 
-                            existing = next((np for np in TARGET_NEWSPAPERS if np["name"].lower() == display_name.lower()), None)
-                            if existing:
-                                existing["search"] = search_term
-                                save_target_newspapers(TARGET_NEWSPAPERS)
-                                await event.reply(f"✏️ Updated newspaper *{display_name}* (Search term: `{search_term}`).")
-                            else:
-                                TARGET_NEWSPAPERS.append({"search": search_term, "name": display_name})
-                                save_target_newspapers(TARGET_NEWSPAPERS)
-                                await event.reply(f"✅ Added newspaper *{display_name}* (Search term: `{search_term}`).")
+            @tg_client.on(events.CallbackQuery(pattern=r"^select_np:(\d+):(\d+)$"))
+            async def handle_newspaper_button_selection(event):
+                try:
+                    np_idx = int(event.pattern_match.group(1))
+                    doc_msg_id = int(event.pattern_match.group(2))
 
-                    elif cmd == "/remove":
-                        raw_arg = text.split(" ", 1)[1].strip() if " " in text else ""
-                        if not raw_arg:
-                            await event.reply("⚠️ *Usage*: `/remove DisplayName`\nExample: `/remove Canarias7`")
-                        else:
-                            target = raw_arg.lower()
-                            matching = [np for np in TARGET_NEWSPAPERS if np["name"].lower() == target or np["search"].lower() == target]
-                            if not matching:
-                                await event.reply(f"❌ Newspaper *{raw_arg}* not found in active list.\nUse `/list` to view active newspapers.")
-                            else:
-                                for np in matching:
-                                    TARGET_NEWSPAPERS.remove(np)
-                                save_target_newspapers(TARGET_NEWSPAPERS)
-                                await event.reply(f"🗑️ Removed *{raw_arg}* from target newspapers list.")
-
-                    elif cmd in ("/help", "/start"):
-                        help_text = (
-                            f"🤖 *WhatsApp Scraper Bot (@{bot_user})*:\n\n"
-                            "• `/status` - Show today's delivery status for all newspapers\n"
-                            "• `/list` - List all active target newspapers\n"
-                            "• `/add SearchTerm:DisplayName` - Add or update a target newspaper\n"
-                            "• `/remove DisplayName` - Remove a newspaper from the list\n"
-                            "• `/help` - Show this help message"
-                        )
-                        await event.reply(help_text)
-
-                await bot_client.run_until_disconnected()
-
-            loop.run_until_complete(_init_bot())
-        except Exception as e:
-            print(f"⚠️ Telegram Bot error: {e}")
-    else:
-        print("💡 Hint: Add TELEGRAM_BOT_TOKEN to .env from @BotFather for instant Telegram bot commands.")
-        try:
-            tg_client, loop = _ensure_tg_initialized()
-            asyncio.set_event_loop(loop)
-
-            async def _init_and_run():
-                admin_chat = await _resolve_admin_chat(tg_client)
-                admin_id = getattr(admin_chat, "id", None)
-                me = await tg_client.get_me()
-                me_id = getattr(me, "id", None)
-
-                print(f"🤖 Telegram user listener active! Send /status, /list, /add, /remove, or /help in private DMs.")
-
-                @tg_client.on(events.NewMessage)
-                async def handle_telegram_command(event):
-                    text = (event.raw_text or "").strip()
-                    if not text.startswith("/"):
+                    if np_idx >= len(TARGET_NEWSPAPERS):
+                        await event.answer("❌ Invalid selection.", alert=True)
                         return
 
-                    if admin_id and event.chat_id != admin_id and event.chat_id != me_id and not event.is_private:
+                    matched_np = TARGET_NEWSPAPERS[np_idx]
+                    await event.answer(f"Selected {matched_np['name']}!")
+
+                    messages = await tg_client.get_messages(event.chat_id, ids=doc_msg_id)
+                    if not messages or not messages.file:
+                        await event.edit("❌ Could not locate the original uploaded file.")
                         return
 
-                    cmd = text.split()[0].lower().split("@")[0]
-                    if cmd == "/status":
-                        status_lines = ["📊 *Today's Newspaper Status*:"]
-                        for np in TARGET_NEWSPAPERS:
-                            st = "✅ Completed" if already_sent_today(np["name"]) else "⏳ Pending"
-                            status_lines.append(f"• *{np['name']}*: {st}")
-                        mode = "DEV (skip-date-check)" if SKIP_DATE_CHECK else "PRODUCTION"
-                        status_lines.append(f"\n⚙️ Mode: `{mode}`")
-                        await event.reply("\n".join(status_lines))
+                    newspaper_name = matched_np["name"]
+                    msg_dt = messages.date or datetime.now()
+                    custom_name = get_newspaper_name(newspaper_name, msg_dt)
+                    save_path = os.path.join(DOWNLOAD_PATH, custom_name)
 
-                    elif cmd == "/list":
-                        if not TARGET_NEWSPAPERS:
-                            await event.reply("📰 No newspapers are currently configured.")
-                        else:
-                            lines = ["📰 *Configured Target Newspapers*:"]
-                            for i, np in enumerate(TARGET_NEWSPAPERS, 1):
-                                st = " (Completed today)" if already_sent_today(np["name"]) else " (Pending)"
-                                lines.append(f"{i}. *{np['name']}*{st}\n   • Search term: `{np['search']}`")
-                            lines.append("\n💡 *Commands*: `/add Search:Name` or `/remove Name`")
-                            await event.reply("\n".join(lines))
+                    target_chat = await _resolve_telegram_chat(tg_client)
+                    if target_chat and not SKIP_DATE_CHECK and await _file_already_sent_today(tg_client, target_chat, custom_name):
+                        print(f"✅ Plan B: '{newspaper_name}' was already sent today. Skipping download.")
+                        await event.edit(f"⚠️ *Plan B*: `{newspaper_name}` has already been delivered today! Skipping download.")
+                        return
 
-                    elif cmd == "/add":
-                        raw_arg = text.split(" ", 1)[1].strip() if " " in text else ""
-                        if not raw_arg:
-                            await event.reply("⚠️ *Usage*: `/add SearchTerm:DisplayName`\nExample: `/add El Pais:El País`")
-                        else:
-                            if ":" in raw_arg:
-                                p_search, p_name = raw_arg.split(":", 1)
-                                search_term, display_name = p_search.strip(), p_name.strip()
-                            else:
-                                search_term, display_name = raw_arg.strip(), raw_arg.strip()
+                    await event.edit(f"⏳ *Plan B Activated*: Matched as `{newspaper_name}`...\nDownloading `{custom_name}`...")
 
-                            existing = next((np for np in TARGET_NEWSPAPERS if np["name"].lower() == display_name.lower()), None)
-                            if existing:
-                                existing["search"] = search_term
-                                save_target_newspapers(TARGET_NEWSPAPERS)
-                                await event.reply(f"✏️ Updated newspaper *{display_name}* (Search term: `{search_term}`).")
-                            else:
-                                TARGET_NEWSPAPERS.append({"search": search_term, "name": display_name})
-                                save_target_newspapers(TARGET_NEWSPAPERS)
-                                await event.reply(f"✅ Added newspaper *{display_name}* (Search term: `{search_term}`).")
+                    last_edit = [0]
+                    async def dl_progress(current, total):
+                        now = time.time()
+                        if total > 0 and (now - last_edit[0] >= 30.0 or current == total):
+                            last_edit[0] = now
+                            pct = int((current / total) * 100)
+                            mb_cur = current / (1024 * 1024)
+                            mb_tot = total / (1024 * 1024)
+                            try:
+                                await event.edit(f"⏳ *Downloading*: `{custom_name}`\n📊 *Progress*: `{pct}%` ({mb_cur:.1f} / {mb_tot:.1f} MB)")
+                            except Exception:
+                                pass
 
-                    elif cmd == "/remove":
-                        raw_arg = text.split(" ", 1)[1].strip() if " " in text else ""
-                        if not raw_arg:
-                            await event.reply("⚠️ *Usage*: `/remove DisplayName`\nExample: `/remove Canarias7`")
-                        else:
-                            target = raw_arg.lower()
-                            matching = [np for np in TARGET_NEWSPAPERS if np["name"].lower() == target or np["search"].lower() == target]
-                            if not matching:
-                                await event.reply(f"❌ Newspaper *{raw_arg}* not found in active list.\nUse `/list` to view active newspapers.")
-                            else:
-                                for np in matching:
-                                    TARGET_NEWSPAPERS.remove(np)
-                                save_target_newspapers(TARGET_NEWSPAPERS)
-                                await event.reply(f"🗑️ Removed *{raw_arg}* from target newspapers list.")
+                    await tg_client.download_media(messages, file=save_path, progress_callback=dl_progress)
+                    print(f"✅ Plan B: Force-matched '{custom_name}' from Telegram upload button click.")
 
-                    elif cmd in ("/help", "/start"):
-                        help_text = (
-                            "🤖 *WhatsApp Scraper Commands*:\n\n"
-                            "• `/status` - Show today's delivery status for all newspapers\n"
-                            "• `/list` - List all active target newspapers\n"
-                            "• `/add SearchTerm:DisplayName` - Add or update a target newspaper\n"
-                            "• `/remove DisplayName` - Remove a newspaper from the list\n"
-                            "• `/help` - Show this help message"
-                        )
-                        await event.reply(help_text)
+                    target_chat = await _resolve_telegram_chat(tg_client)
+                    if target_chat is None:
+                        await event.edit(f"❌ Could not resolve Telegram channel `{TELEGRAM_NEWSPAPERS_CHAT_NAME}`.")
+                        return
 
-                await tg_client.run_until_disconnected()
+                    await event.edit(f"📤 *Uploading to Channel*: `{custom_name}`...")
+                    await _send_day_header(tg_client, target_chat)
+                    await tg_client.send_file(target_chat, save_path)
+                    save_sent_date(newspaper_name)
+                    print(f"🚀 Plan B: Force-matched and sent '{custom_name}' to Telegram channel successfully!")
 
-            loop.run_until_complete(_init_and_run())
-        except Exception as e:
-            print(f"⚠️ Telegram listener thread stopped: {e}")
+                    if os.path.exists(save_path):
+                        try:
+                            os.remove(save_path)
+                            print(f"🧹 Cleaned up local file '{custom_name}'.")
+                        except Exception: pass
+
+                    target_display = TELEGRAM_NEWSPAPERS_CHAT_NAME or TELEGRAM_NEWSPAPERS_CHAT_ID or "Target Channel"
+                    await event.edit(
+                        f"✅ *Plan B Success*!\n\n"
+                        f"📰 *Matched Newspaper*: *{newspaper_name}*\n"
+                        f"📄 *File*: `{custom_name}`\n"
+                        f"📨 Delivered to `{target_display}`."
+                    )
+                except Exception as e:
+                    print(f"❌ Force selection failed: {e}")
+                    await event.edit(f"❌ *Plan B Selection Error*: {e}")
+
+            admin_chat = await _resolve_admin_chat(tg_client)
+            admin_id = getattr(admin_chat, "id", None) if hasattr(admin_chat, "id") else None
+            me_id = getattr(me, "id", None)
+
+            @tg_client.on(events.NewMessage)
+            async def handle_telegram_command(event):
+                # Forward caching removed (no longer needed)
+
+                # Handle Direct File Upload (Plan B)
+                if event.message.file and (event.is_private or is_bot):
+                    await _process_uploaded_telegram_document(event)
+                    return
+
+                text = (event.raw_text or "").strip()
+                if not text.startswith("/"):
+                    return
+
+                if not is_bot and admin_id and event.chat_id != admin_id and event.chat_id != me_id and not event.is_private:
+                    return
+
+                reply = process_bot_command(text)
+                if reply:
+                    await event.reply(reply)
+                    return
+
+            await tg_client.run_until_disconnected()
+
+        loop.run_until_complete(_init_and_run())
+    except Exception as e:
+        print(f"⚠️ Telegram listener error: {e}")
 
 
 def _start_telegram_listener():
