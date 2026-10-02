@@ -6,6 +6,7 @@ import argparse
 import json
 import io
 import threading
+import queue
 import asyncio
 import pytz
 import qrcode
@@ -17,6 +18,65 @@ from neonize.utils import build_jid
 from telethon import events, Button
 from telethon.sync import TelegramClient
 from naming_utils import get_newspaper_name
+import re
+
+# --- TIME HELPERS (single source of truth for "today") ---
+# The container runs in UTC; papers are posted around local midnight, so every
+# date comparison must use the newspapers' local time zone, not the host clock.
+LOCAL_TZ = pytz.timezone(os.getenv("LOCAL_TIMEZONE", "Atlantic/Canary"))
+
+
+def local_today() -> date:
+    return datetime.now(LOCAL_TZ).date()
+
+
+def ts_to_local_date(ts) -> date:
+    """Convert a WhatsApp timestamp (seconds or milliseconds) to a local date."""
+    ts = float(ts)
+    if ts > 9999999999:
+        ts /= 1000
+    return datetime.fromtimestamp(ts, LOCAL_TZ).date()
+
+
+def to_local_date(dt) -> date:
+    """Convert a datetime (aware or naive UTC, e.g. from Telethon) to a local date."""
+    if dt is None:
+        return local_today()
+    if dt.tzinfo is None:
+        dt = pytz.utc.localize(dt)
+    return dt.astimezone(LOCAL_TZ).date()
+
+
+_FILENAME_DATE_RE = re.compile(r"(\d{1,2})[-_.](\d{1,2})[-_.](\d{2,4})")
+
+
+def filename_date(file_name: str):
+    """Extract a DD-MM-YY(YY) date from a file name like '25-09-26-Marca.pdf'."""
+    m = _FILENAME_DATE_RE.search(file_name or "")
+    if not m:
+        return None
+    d, mth, y = (int(x) for x in m.groups())
+    if y < 100:
+        y += 2000
+    try:
+        return date(y, mth, d)
+    except ValueError:
+        return None
+
+
+def is_from_today(ts, file_name: str = "") -> bool:
+    """ALWAYS-ON freshness gate. Independent of SKIP_DATE_CHECK.
+
+    The message must have been posted today (local time) and, if the file name
+    carries a date, that date must be today as well. This stops the WhatsApp
+    offline backlog (days of queued messages delivered on reconnect) and
+    re-posted/forwarded old papers from ever being sent.
+    """
+    today = local_today()
+    if ts_to_local_date(ts) != today:
+        return False
+    fd = filename_date(file_name)
+    return fd is None or fd == today
 
 # Reconfigure stdout/stderr for Unicode/emoji support on Windows terminals
 if hasattr(sys.stdout, "reconfigure"):
@@ -70,6 +130,23 @@ def matches_newspaper(text: str, np_entry: dict) -> bool:
         if alias_clean and alias_clean in text_lower:
             return True
     return False
+
+
+def find_newspaper(text: str):
+    """Return the newspaper whose name/alias gives the LONGEST match in the text.
+
+    Every alias resolves to its display name, so 'La Provincia Las Palmas' -> La Provincia
+    and 'El Mundo Completo' -> El Mundo. Longest-match avoids one paper's short alias
+    stealing another paper's file.
+    """
+    t = (text or "").strip().lower()
+    best, best_len = None, 0
+    for np in TARGET_NEWSPAPERS:
+        for term in [np.get("name", "")] + get_search_aliases(np):
+            term = term.strip().lower()
+            if term and term in t and len(term) > best_len:
+                best, best_len = np, len(term)
+    return best
 
 
 def load_target_newspapers():
@@ -184,11 +261,11 @@ def already_sent_today(newspaper_name: str) -> bool:
     """Check if we already sent today's paper for a given newspaper (respects skip flag)."""
     if SKIP_DATE_CHECK:
         return False
-    return SENT_LOG_DATA.get(newspaper_name) == str(date.today())
+    return SENT_LOG_DATA.get(newspaper_name) == str(local_today())
 
 
 def save_sent_date(newspaper_name: str):
-    today_str = str(date.today())
+    today_str = str(local_today())
     SENT_LOG_DATA[newspaper_name] = today_str
     with open(SENT_LOG_FILE, "w") as f:
         json.dump(SENT_LOG_DATA, f, indent=2)
@@ -297,7 +374,7 @@ def _pretty_print_date(dt):
 
 async def _send_day_header(tg_client, chat):
     """Send a day marker message if none has been sent today."""
-    tz = pytz.timezone('Atlantic/Canary')
+    tz = LOCAL_TZ
     now = datetime.now(tz)
 
     # 1. Local persistent tracking check
@@ -342,7 +419,7 @@ async def _file_already_sent_today(tg_client, chat, custom_name):
 
     # 2. Inspect channel history (file names + message text captions)
     try:
-        tz = pytz.timezone('Atlantic/Canary')
+        tz = LOCAL_TZ
         now = datetime.now(tz)
         target_clean = custom_name.replace(".pdf", "").split(",")[0].strip().lower()
 
@@ -362,6 +439,9 @@ async def _file_already_sent_today(tg_client, chat, custom_name):
         print(f"💡 Note: Channel history check skipped ({ex}).")
 
     return False
+
+
+SEND_TIMEOUT_SECONDS = int(os.getenv("SEND_TIMEOUT_SECONDS", "600"))
 
 
 def send_to_telegram(file_path, custom_name, is_manual: bool = False):
@@ -386,9 +466,14 @@ def send_to_telegram(file_path, custom_name, is_manual: bool = False):
             return True
 
         future = asyncio.run_coroutine_threadsafe(_do_send(), loop)
-        return future.result(timeout=60)
+        try:
+            return future.result(timeout=SEND_TIMEOUT_SECONDS)
+        except TimeoutError:
+            future.cancel()  # stop the background upload so it can't land later as a duplicate
+            print(f"❌ Failed to send to Telegram: upload timed out after {SEND_TIMEOUT_SECONDS}s")
+            return False
     except Exception as e:
-        print(f"❌ Failed to send to Telegram: {e}")
+        print(f"❌ Failed to send to Telegram: {type(e).__name__}: {e}")
         return False
 
 
@@ -479,9 +564,7 @@ def download_file(client, message_ev, newspaper_name: str, is_manual: bool = Fal
         return True
 
     doc = message_ev.Message.documentMessage
-    ts = message_ev.Info.Timestamp
-    if ts > 9999999999: ts /= 1000
-    msg_date = datetime.fromtimestamp(ts).date()
+    msg_date = ts_to_local_date(message_ev.Info.Timestamp)
 
     custom_name = get_newspaper_name(newspaper_name, msg_date)
     path = os.path.join(DOWNLOAD_PATH, custom_name)
@@ -535,6 +618,63 @@ def download_file(client, message_ev, newspaper_name: str, is_manual: bool = Fal
     print(f"❌ Failed to download '{custom_name}' after 3 cycles.")
     send_telegram_alert(f"⚠️ *WhatsApp Scraper Download Error*\nFailed to download newspaper '{custom_name}' after 3 retry cycles.")
     return False
+
+
+# --- ONE DELIVERY PER NEWSPAPER PER DAY ---
+# A newspaper is "claimed" the moment a matching file is accepted. Any other file for
+# the same newspaper (another alias, e.g. "El Mundo Completo") is ignored until
+# tomorrow. If the delivery fails, the claim is released so another file can be tried.
+# This applies in DEV mode too; SKIP_DATE_CHECK only ignores what previous runs sent.
+_CLAIM_LOCK = threading.Lock()
+_CLAIMED = {}  # newspaper name -> "YYYY-MM-DD"
+
+
+def try_claim(newspaper_name: str) -> bool:
+    today = str(local_today())
+    with _CLAIM_LOCK:
+        if _CLAIMED.get(newspaper_name) == today:
+            return False
+        if not SKIP_DATE_CHECK and SENT_LOG_DATA.get(newspaper_name) == today:
+            return False
+        _CLAIMED[newspaper_name] = today
+        return True
+
+
+def release_claim(newspaper_name: str):
+    with _CLAIM_LOCK:
+        if _CLAIMED.get(newspaper_name) == str(local_today()):
+            _CLAIMED.pop(newspaper_name, None)
+
+
+# --- BACKGROUND DELIVERY WORKER ---
+# Downloads + Telegram uploads used to run inside the WhatsApp event handler, which
+# blocked neonize for 30-60s per paper ("Node handling took ..."). Now the handler only
+# queues the job; a single worker thread processes jobs one by one, in order.
+_DELIVERY_QUEUE = queue.Queue()
+
+
+def enqueue_delivery(newspaper_name: str, job):
+    """job: callable returning True on success. Failure releases the day's claim."""
+    _DELIVERY_QUEUE.put((newspaper_name, job))
+
+
+def _delivery_worker():
+    while True:
+        newspaper_name, job = _DELIVERY_QUEUE.get()
+        ok = False
+        try:
+            ok = bool(job())
+        except Exception as e:
+            print(f"⚠️ Delivery job for '{newspaper_name}' crashed: {e}")
+        finally:
+            if not ok:
+                release_claim(newspaper_name)
+                print(f"🔓 '{newspaper_name}' delivery failed; another file for it may be accepted today.")
+            _DELIVERY_QUEUE.task_done()
+
+
+def _start_delivery_worker():
+    threading.Thread(target=_delivery_worker, daemon=True, name="DeliveryWorker").start()
 
 
 PENDING_WA_SELECTIONS = {}
@@ -627,6 +767,57 @@ def process_bot_command(text: str) -> str:
     return None
 
 
+def _queue_wa_plan_b(client, reply_to_ev, doc_ev, name: str, reason: str):
+    """Claim the newspaper for today and queue a WhatsApp Plan B delivery."""
+    if not try_claim(name):
+        print(f"✅ Plan B WhatsApp: '{name}' already sent or in progress today. Skipping.")
+        _send_wa_reply(client, reply_to_ev, f"⚠️ *Plan B WhatsApp*: `{name}` has already been delivered (or is being delivered) today. Skipping.")
+        return
+
+    print(f"🎯 Plan B WhatsApp: [{name}] {reason}")
+    _send_wa_reply(client, reply_to_ev, f"⏳ *Plan B WhatsApp*: Processing as `{name}`...")
+
+    def _job():
+        ok = download_file(client, doc_ev, name, is_manual=True)
+        if ok:
+            _send_wa_reply(client, reply_to_ev, f"✅ *Plan B WhatsApp Success*: Delivered `{name}` to Telegram!")
+        else:
+            _send_wa_reply(client, reply_to_ev, f"❌ *Plan B WhatsApp Error*: Failed to process `{name}`.")
+        return ok
+
+    enqueue_delivery(name, _job)
+
+
+# --- WHATSAPP DM AUTHORIZATION ---
+# The bot runs as a linked device on a normal WhatsApp account, so it sees every
+# private chat on that account, including messages YOU type to other people/bots.
+# Commands and Plan B are only accepted from:
+#   - your own "Message yourself" chat (messages you send to yourself), or
+#   - numbers listed in WA_ADMIN_NUMBERS (comma-separated, digits only, e.g. 34600000000)
+WA_ADMIN_NUMBERS = {
+    n.strip().lstrip("+") for n in os.getenv("WA_ADMIN_NUMBERS", "").split(",") if n.strip()
+}
+
+
+def _jid_user(jid) -> str:
+    return (getattr(jid, "User", "") or "") if jid is not None else ""
+
+
+def _is_authorized_dm(message_ev) -> bool:
+    src = message_ev.Info.MessageSource
+    chat_user = _jid_user(src.Chat)
+    sender_ids = {_jid_user(src.Sender), _jid_user(getattr(src, "SenderAlt", None))} - {""}
+
+    if getattr(src, "IsFromMe", False):
+        # Something you sent: only act on it in the chat with yourself,
+        # never in chats with other people or other bots.
+        own_ids = sender_ids | {_jid_user(getattr(src, "RecipientAlt", None))}
+        return chat_user in own_ids
+
+    # Something someone else sent you: only trusted admin numbers.
+    return bool(WA_ADMIN_NUMBERS & sender_ids)
+
+
 @client.event(MessageEv)
 def on_message(client: NewClient, message: MessageEv):
     try:
@@ -637,27 +828,38 @@ def on_message(client: NewClient, message: MessageEv):
         chat_info = message.Info.MessageSource.Chat
         current_chat_id = f"{chat_info.User}@{chat_info.Server}"
 
-        ts = message.Info.Timestamp
-        if ts > 9999999999: ts /= 1000
-        msg_dt = datetime.fromtimestamp(ts)
         msg_obj = message.Message
+
+        # Never act on anything that wasn't posted today (local time). This runs
+        # before everything else, so the offline backlog delivered on reconnect
+        # is ignored by group scraping, Plan B and commands alike.
+        if not is_from_today(message.Info.Timestamp):
+            return
 
         # 1. Target Group Scraping
         if current_chat_id == TARGET_GROUP_ID:
             if hasattr(msg_obj, "documentMessage") and msg_obj.documentMessage:
                 file_name = msg_obj.documentMessage.fileName or ""
 
-                for np in TARGET_NEWSPAPERS:
-                    if not SKIP_DATE_CHECK and already_sent_today(np["name"]):
-                        continue
-                    if matches_newspaper(file_name, np) and (SKIP_DATE_CHECK or msg_dt.date() == date.today()):
+                np = find_newspaper(file_name)
+                if np and is_from_today(message.Info.Timestamp, file_name):
+                    name = np["name"]
+                    if not try_claim(name):
+                        print(f"⏭️ [{name}] already sent or in progress today, ignoring '{file_name}'.")
+                    else:
                         sender = getattr(message.Info, "PushName", "Someone")
-                        print(f"\n🎯 TARGET DETECTED [{np['name']}] from {sender}: {file_name}")
-                        download_file(client, message, np["name"], is_manual=False)
-                        break
+                        print(f"\n🎯 TARGET DETECTED [{name}] from {sender}: {file_name}")
+                        enqueue_delivery(name, lambda m=message, n=name: download_file(client, m, n, is_manual=False))
 
         # 2. Plan B: Direct WhatsApp DM / Manual Upload / Commands
-        elif chat_info.Server != "g.us" or current_chat_id != TARGET_GROUP_ID:
+        # Only real one-to-one chats. The old condition matched EVERY other group,
+        # so PDFs from unrelated groups were "Plan B uploads" and the bot replied there.
+        # ...and only from someone allowed to control the bot. Without this, the bot
+        # answered /start, /help, PDFs, or any text after a menu in EVERY private chat,
+        # including chats where you were talking to someone else's bot.
+        elif (chat_info.Server != "g.us"
+              and not getattr(message.Info.MessageSource, "IsGroup", False)
+              and _is_authorized_dm(message)):
             # Check for bot commands in WhatsApp DM (/status, /list, /add, /remove, /help)
             text_content = ""
             if hasattr(msg_obj, "conversation") and msg_obj.conversation:
@@ -680,24 +882,11 @@ def on_message(client: NewClient, message: MessageEv):
                         if 0 <= idx < len(TARGET_NEWSPAPERS):
                             matched_np = TARGET_NEWSPAPERS[idx]
                     else:
-                        for np in TARGET_NEWSPAPERS:
-                            if matches_newspaper(text_content, np):
-                                matched_np = np
-                                break
+                        matched_np = find_newspaper(text_content)
 
                     if matched_np:
                         saved_ev = PENDING_WA_SELECTIONS.pop(current_chat_id)
-                        if not SKIP_DATE_CHECK and already_sent_today(matched_np["name"]):
-                            print(f"✅ Plan B WhatsApp: '{matched_np['name']}' was already sent today. Skipping download.")
-                            _send_wa_reply(client, message, f"⚠️ *Plan B WhatsApp*: `{matched_np['name']}` has already been delivered today! Skipping download.")
-                            return
-
-                        print(f"🎯 Plan B WhatsApp: Selected [{matched_np['name']}] via text reply.")
-                        _send_wa_reply(client, message, f"⏳ *Plan B WhatsApp*: Processing as `{matched_np['name']}`...")
-                        if download_file(client, saved_ev, matched_np["name"], is_manual=True):
-                            _send_wa_reply(client, message, f"✅ *Plan B WhatsApp Success*: Delivered `{matched_np['name']}` to Telegram!")
-                        else:
-                            _send_wa_reply(client, message, f"❌ *Plan B WhatsApp Error*: Failed to process `{matched_np['name']}`.")
+                        _queue_wa_plan_b(client, message, saved_ev, matched_np["name"], "Selected via text reply")
                         return
                     else:
                         _send_wa_reply(client, message, "⚠️ Invalid choice. Please reply with the number (e.g. 1) or newspaper name.")
@@ -708,24 +897,10 @@ def on_message(client: NewClient, message: MessageEv):
                 file_name = msg_obj.documentMessage.fileName or ""
                 print(f"\n📩 Plan B WhatsApp: Received direct document upload '{file_name}'")
 
-                matched_np = None
-                for np in TARGET_NEWSPAPERS:
-                    if matches_newspaper(file_name, np):
-                        matched_np = np
-                        break
+                matched_np = find_newspaper(file_name)
 
                 if matched_np:
-                    if not SKIP_DATE_CHECK and already_sent_today(matched_np["name"]):
-                        print(f"✅ Plan B WhatsApp: '{matched_np['name']}' was already sent today. Skipping download.")
-                        _send_wa_reply(client, message, f"⚠️ *Plan B WhatsApp*: `{matched_np['name']}` has already been delivered today! Skipping download.")
-                        return
-
-                    print(f"🎯 Plan B WhatsApp: Auto-matched [{matched_np['name']}] for '{file_name}'")
-                    _send_wa_reply(client, message, f"⏳ *Plan B WhatsApp*: Auto-matched `{matched_np['name']}`. Downloading & forwarding...")
-                    if download_file(client, message, matched_np["name"], is_manual=True):
-                        _send_wa_reply(client, message, f"✅ *Plan B WhatsApp Success*: Delivered `{matched_np['name']}` to Telegram!")
-                    else:
-                        _send_wa_reply(client, message, f"❌ *Plan B WhatsApp Error*: Failed to process `{matched_np['name']}`.")
+                    _queue_wa_plan_b(client, message, message, matched_np["name"], f"Auto-matched '{file_name}'")
                 else:
                     PENDING_WA_SELECTIONS[current_chat_id] = message
                     lines = [f"⚠️ *Plan B WhatsApp*: Could not auto-detect newspaper for `{file_name}`.\n\nPlease reply with the number or name of the newspaper:"]
@@ -844,20 +1019,14 @@ def _retry_scan(wa_client):
                 if not hasattr(msg_obj, "documentMessage") or not msg_obj.documentMessage:
                     continue
                 file_name = msg_obj.documentMessage.fileName or ""
-                ts = msg_info.Info.Timestamp
-                if ts > 9999999999:
-                    ts /= 1000
-                msg_dt = datetime.fromtimestamp(ts)
-
-                if msg_dt.date() != date.today():
+                if not is_from_today(msg_info.Info.Timestamp, file_name):
                     continue
 
-                for np in list(pending_nps):
-                    if matches_newspaper(file_name, np):
-                        print(f"🎯 Found today's newspaper [{np['name']}] in history: {file_name}")
-                        if download_file(wa_client, msg_info, np["name"]):
-                            pending_nps.remove(np)
-                        break
+                np = find_newspaper(file_name)
+                if np in pending_nps and try_claim(np["name"]):
+                    print(f"🎯 Found today's newspaper [{np['name']}] in history: {file_name}")
+                    pending_nps.remove(np)
+                    enqueue_delivery(np["name"], lambda m=msg_info, n=np["name"]: download_file(wa_client, m, n))
             except Exception:
                 continue
 
@@ -866,7 +1035,7 @@ def _retry_scan(wa_client):
             print(f"❌ Pending newspaper(s) not found in recent history: {pending_names}")
             print("   The bot will keep listening for new messages.")
         else:
-            print("✅ Retry scan complete! All newspapers processed.")
+            print("✅ Retry scan complete! All pending newspapers queued for delivery.")
     except Exception as e:
         print(f"⚠️ Retry scan failed: {e}")
         print("   The bot will keep listening for new messages.")
@@ -882,8 +1051,18 @@ def run_telegram_listener():
     """Run Telegram command listener in a background daemon thread.
     Uses the unified TG_CLIENT instance (Bot API or User account)."""
     try:
-        tg_client, loop = _ensure_tg_initialized()
+        _, loop = _ensure_tg_initialized()
         asyncio.set_event_loop(loop)
+        # Commands / Plan B must run on the BOT (@BotFather token). Previously the
+        # user account was preferred, so the listener saw every chat of that account,
+        # including its OUTGOING messages, and answered in chats with other bots.
+        tg_client = TG_BOT_CLIENT or TG_USER_CLIENT
+        # Channel history + posting must use the USER account when available
+        # (bots can't read channel history).
+        chan_client = TG_USER_CLIENT or TG_BOT_CLIENT
+        if tg_client is None:
+            print("⚠️ No Telegram client available for the listener.")
+            return
 
         async def _init_and_run():
             me = await tg_client.get_me()
@@ -894,6 +1073,21 @@ def run_telegram_listener():
                 print(f"🤖 Official Telegram Bot active (@{username})! Send /status, /list, /add, /remove, or /help to @{username}.")
             else:
                 print(f"🤖 Telegram listener active (@{username})! Send /status, /list, /add, /remove, or /help in private DMs.")
+
+            # Resolve the admin with the user account when possible: bots can't resolve phone numbers.
+            admin_chat = await _resolve_admin_chat(TG_USER_CLIENT or tg_client)
+            admin_id = getattr(admin_chat, "id", None)
+            if admin_id is None:
+                print("⚠️ TELEGRAM_ADMIN_CHAT could not be resolved to a user ID. "
+                      "Only Saved Messages (user mode) will be accepted; the bot will ignore everyone.")
+
+            def _is_authorized(event) -> bool:
+                """Only the admin, in a private chat, may use commands / Plan B."""
+                if getattr(event, "out", False):
+                    # Our own outgoing messages: only 'Saved Messages' in user mode.
+                    # Never react to what this account types to other people or bots.
+                    return (not is_bot) and event.chat_id == me_id
+                return bool(event.is_private) and admin_id is not None and event.sender_id == admin_id
 
             async def _process_uploaded_telegram_document(event):
                 """Process a PDF/document sent directly to the Telegram bot as Plan B fallback."""
@@ -906,11 +1100,7 @@ def run_telegram_listener():
                 search_haystack = f"{orig_name} {caption_text}".lower()
 
                 # Find matching target newspaper automatically
-                matched_np = None
-                for np in TARGET_NEWSPAPERS:
-                    if matches_newspaper(search_haystack, np):
-                        matched_np = np
-                        break
+                matched_np = find_newspaper(search_haystack)
 
                 # If no auto-match, prompt with interactive inline buttons to select newspaper
                 if not matched_np:
@@ -926,18 +1116,22 @@ def run_telegram_listener():
                     return
 
                 newspaper_name = matched_np["name"]
-                msg_dt = event.message.date or datetime.now()
-                custom_name = get_newspaper_name(newspaper_name, msg_dt)
+                custom_name = get_newspaper_name(newspaper_name, to_local_date(event.message.date))
                 save_path = os.path.join(DOWNLOAD_PATH, custom_name)
 
-                target_chat = await _resolve_telegram_chat(tg_client)
-                if target_chat and not SKIP_DATE_CHECK and await _file_already_sent_today(tg_client, target_chat, custom_name):
+                if not try_claim(newspaper_name):
+                    await event.reply(f"⚠️ *Plan B*: `{newspaper_name}` has already been delivered (or is being delivered) today. Skipping.")
+                    return
+
+                target_chat = await _resolve_telegram_chat(chan_client)
+                if target_chat and not SKIP_DATE_CHECK and await _file_already_sent_today(chan_client, target_chat, custom_name):
                     print(f"✅ Plan B: '{newspaper_name}' was already sent today. Skipping download.")
                     await event.reply(f"⚠️ *Plan B*: `{newspaper_name}` has already been delivered today! Skipping download.")
                     return
 
                 status_msg = await event.reply(f"⏳ *Plan B Activated*: Downloading `{custom_name}`...")
 
+                delivered = False
                 try:
                     last_edit = [0]
                     async def dl_progress(current, total):
@@ -955,15 +1149,16 @@ def run_telegram_listener():
                     await tg_client.download_media(event.message, file=save_path, progress_callback=dl_progress)
                     print(f"✅ Plan B: Downloaded '{custom_name}' directly from Telegram upload.")
 
-                    target_chat = await _resolve_telegram_chat(tg_client)
+                    target_chat = await _resolve_telegram_chat(chan_client)
                     if target_chat is None:
                         await status_msg.edit(f"❌ Could not resolve Telegram channel `{TELEGRAM_NEWSPAPERS_CHAT_NAME}`.")
                         return
 
                     await status_msg.edit(f"📤 *Uploading to Channel*: `{custom_name}`...")
-                    await _send_day_header(tg_client, target_chat)
-                    await tg_client.send_file(target_chat, save_path)
+                    await _send_day_header(chan_client, target_chat)
+                    await chan_client.send_file(target_chat, save_path)
                     save_sent_date(newspaper_name)
+                    delivered = True
                     print(f"🚀 Plan B: Sent '{custom_name}' to Telegram channel successfully!")
 
                     if os.path.exists(save_path):
@@ -982,9 +1177,17 @@ def run_telegram_listener():
                 except Exception as e:
                     print(f"❌ Plan B failed: {e}")
                     await status_msg.edit(f"❌ *Plan B Error*: Failed to process `{custom_name}`: {e}")
+                finally:
+                    if not delivered:
+                        release_claim(newspaper_name)
 
             @tg_client.on(events.CallbackQuery(pattern=r"^select_np:(\d+):(\d+)$"))
             async def handle_newspaper_button_selection(event):
+                if admin_id is None or event.sender_id != admin_id:
+                    await event.answer("Not authorized.", alert=True)
+                    return
+                claimed = delivered = False
+                newspaper_name = None
                 try:
                     np_idx = int(event.pattern_match.group(1))
                     doc_msg_id = int(event.pattern_match.group(2))
@@ -1002,14 +1205,19 @@ def run_telegram_listener():
                         return
 
                     newspaper_name = matched_np["name"]
-                    msg_dt = messages.date or datetime.now()
-                    custom_name = get_newspaper_name(newspaper_name, msg_dt)
+                    custom_name = get_newspaper_name(newspaper_name, to_local_date(messages.date))
                     save_path = os.path.join(DOWNLOAD_PATH, custom_name)
 
-                    target_chat = await _resolve_telegram_chat(tg_client)
-                    if target_chat and not SKIP_DATE_CHECK and await _file_already_sent_today(tg_client, target_chat, custom_name):
+                    if not try_claim(newspaper_name):
+                        await event.edit(f"⚠️ *Plan B*: `{newspaper_name}` has already been delivered (or is being delivered) today. Skipping.")
+                        return
+                    claimed = True
+
+                    target_chat = await _resolve_telegram_chat(chan_client)
+                    if target_chat and not SKIP_DATE_CHECK and await _file_already_sent_today(chan_client, target_chat, custom_name):
                         print(f"✅ Plan B: '{newspaper_name}' was already sent today. Skipping download.")
                         await event.edit(f"⚠️ *Plan B*: `{newspaper_name}` has already been delivered today! Skipping download.")
+                        delivered = True
                         return
 
                     await event.edit(f"⏳ *Plan B Activated*: Matched as `{newspaper_name}`...\nDownloading `{custom_name}`...")
@@ -1030,15 +1238,16 @@ def run_telegram_listener():
                     await tg_client.download_media(messages, file=save_path, progress_callback=dl_progress)
                     print(f"✅ Plan B: Force-matched '{custom_name}' from Telegram upload button click.")
 
-                    target_chat = await _resolve_telegram_chat(tg_client)
+                    target_chat = await _resolve_telegram_chat(chan_client)
                     if target_chat is None:
                         await event.edit(f"❌ Could not resolve Telegram channel `{TELEGRAM_NEWSPAPERS_CHAT_NAME}`.")
                         return
 
                     await event.edit(f"📤 *Uploading to Channel*: `{custom_name}`...")
-                    await _send_day_header(tg_client, target_chat)
-                    await tg_client.send_file(target_chat, save_path)
+                    await _send_day_header(chan_client, target_chat)
+                    await chan_client.send_file(target_chat, save_path)
                     save_sent_date(newspaper_name)
+                    delivered = True
                     print(f"🚀 Plan B: Force-matched and sent '{custom_name}' to Telegram channel successfully!")
 
                     if os.path.exists(save_path):
@@ -1057,25 +1266,24 @@ def run_telegram_listener():
                 except Exception as e:
                     print(f"❌ Force selection failed: {e}")
                     await event.edit(f"❌ *Plan B Selection Error*: {e}")
+                finally:
+                    if claimed and not delivered:
+                        release_claim(newspaper_name)
 
-            admin_chat = await _resolve_admin_chat(tg_client)
-            admin_id = getattr(admin_chat, "id", None) if hasattr(admin_chat, "id") else None
             me_id = getattr(me, "id", None)
 
             @tg_client.on(events.NewMessage)
             async def handle_telegram_command(event):
-                # Forward caching removed (no longer needed)
+                if not _is_authorized(event):
+                    return
 
                 # Handle Direct File Upload (Plan B)
-                if event.message.file and (event.is_private or is_bot):
+                if event.message.file:
                     await _process_uploaded_telegram_document(event)
                     return
 
                 text = (event.raw_text or "").strip()
                 if not text.startswith("/"):
-                    return
-
-                if not is_bot and admin_id and event.chat_id != admin_id and event.chat_id != me_id and not event.is_private:
                     return
 
                 reply = process_bot_command(text)
@@ -1104,6 +1312,7 @@ if __name__ == "__main__":
             print("   In Docker: docker exec <container> kill -USR1 1")
 
         _ensure_telegram_session()
+        _start_delivery_worker()
         _start_telegram_listener()
         client.connect()
     except KeyboardInterrupt:
