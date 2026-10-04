@@ -5,15 +5,17 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install system dependencies
-# libmagic1 is required by neonize/python-magic
+# libmagic1 and ffmpeg are required/recommended by neonize and media handling
 RUN apt-get update && apt-get install -y \
     libmagic1 \
+    ffmpeg \
     gcc \
     python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the requirements (since we don't have requirements.txt, we install manually)
-RUN pip install --no-cache-dir neonize python-dotenv telethon pytz qrcode pillow
+# Copy requirements and install Python dependencies (layer caching)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the application code
 COPY . .

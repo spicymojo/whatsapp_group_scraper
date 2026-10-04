@@ -5,6 +5,8 @@ services:
     build: .
     container_name: whatsapp-newspaper
     restart: unless-stopped
+    stdin_open: true
+    tty: true
     volumes:
       - .:/app
     environment:
@@ -13,3 +15,8 @@ services:
     # If you want to use the .env file in this directory
     env_file:
       - .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

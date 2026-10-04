@@ -99,11 +99,29 @@ _disconnect_lock = threading.Lock()
 NEWSPAPER_CONFIG_FILE = "config_newspapers.json"
 
 
-def save_target_newspapers(newspapers_list):
-    """Save the active newspapers list to config_newspapers.json."""
+def atomic_save_json(filepath: str, data) -> bool:
+    """Save data to JSON atomically using a temporary file to prevent corruption on crash or restart."""
+    tmp_path = f"{filepath}.tmp"
     try:
-        with open(NEWSPAPER_CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(newspapers_list, f, indent=2, ensure_ascii=False)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, filepath)
+        return True
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        raise e
+
+
+def save_target_newspapers(newspapers_list):
+    """Save the active newspapers list to config_newspapers.json atomically."""
+    try:
+        atomic_save_json(NEWSPAPER_CONFIG_FILE, newspapers_list)
         print(f"💾 Saved {len(newspapers_list)} newspaper configuration(s) to '{NEWSPAPER_CONFIG_FILE}'.")
     except Exception as e:
         print(f"⚠️ Failed to save newspaper config: {e}")
@@ -267,8 +285,10 @@ def already_sent_today(newspaper_name: str) -> bool:
 def save_sent_date(newspaper_name: str):
     today_str = str(local_today())
     SENT_LOG_DATA[newspaper_name] = today_str
-    with open(SENT_LOG_FILE, "w") as f:
-        json.dump(SENT_LOG_DATA, f, indent=2)
+    try:
+        atomic_save_json(SENT_LOG_FILE, SENT_LOG_DATA)
+    except Exception as e:
+        print(f"⚠️ Failed to save sent log to '{SENT_LOG_FILE}': {e}")
     return today_str
 
 
@@ -1305,6 +1325,14 @@ def _start_telegram_listener():
 
 if __name__ == "__main__":
     try:
+        def _handle_shutdown_signal(signum, frame):
+            print("\n👋 Received stop signal (SIGTERM), shutting down safely...")
+            os._exit(0)
+
+        # On Linux/Docker, register SIGTERM for graceful container stops
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+
         # On Linux/Docker, register SIGUSR1 for runtime retry
         if hasattr(signal, "SIGUSR1"):
             signal.signal(signal.SIGUSR1, _handle_retry_signal)
