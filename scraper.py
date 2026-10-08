@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 import time
@@ -10,8 +11,22 @@ import queue
 import asyncio
 import pytz
 import qrcode
+import unicodedata
 from datetime import datetime, date
 from dotenv import load_dotenv
+
+# Suppress noisy Telethon update diff log spam
+logging.getLogger("telethon").setLevel(logging.WARNING)
+logging.getLogger("telethon.client.updates").setLevel(logging.WARNING)
+
+
+def normalize_text(text: str) -> str:
+    """Normalize text by stripping accents/diacritics, lowercasing, and trimming."""
+    if not text:
+        return ""
+    nfkd = unicodedata.normalize("NFD", text)
+    no_accents = "".join(c for c in nfkd if unicodedata.category(c) != "Mn")
+    return no_accents.lower().strip()
 from neonize.client import NewClient
 from neonize.events import MessageEv, ConnectedEv, DisconnectedEv, LoggedOutEv, ConnectFailureEv
 from neonize.utils import build_jid
@@ -136,81 +151,99 @@ def get_search_aliases(np_entry: dict) -> list:
 
 
 def matches_newspaper(text: str, np_entry: dict) -> bool:
-    """Checks if any search alias or display name matches the input text (case-insensitive and trimmed)."""
+    """Checks if any search alias or display name matches the input text (accent and case-insensitive)."""
     if not text or not np_entry:
         return False
-    text_lower = text.strip().lower()
-    name_clean = np_entry.get("name", "").strip().lower()
-    if name_clean and name_clean in text_lower:
+    text_norm = normalize_text(text)
+    name_norm = normalize_text(np_entry.get("name", ""))
+    if name_norm and name_norm in text_norm:
         return True
     for alias in get_search_aliases(np_entry):
-        alias_clean = alias.strip().lower()
-        if alias_clean and alias_clean in text_lower:
+        alias_norm = normalize_text(alias)
+        if alias_norm and alias_norm in text_norm:
             return True
     return False
 
 
 def find_newspaper(text: str):
-    """Return the newspaper whose name/alias gives the LONGEST match in the text.
+    """Return the newspaper whose name/alias gives the LONGEST match in the text (accent and case-insensitive).
 
     Every alias resolves to its display name, so 'La Provincia Las Palmas' -> La Provincia
     and 'El Mundo Completo' -> El Mundo. Longest-match avoids one paper's short alias
     stealing another paper's file.
     """
-    t = (text or "").strip().lower()
+    t_norm = normalize_text(text)
     best, best_len = None, 0
     for np in TARGET_NEWSPAPERS:
         for term in [np.get("name", "")] + get_search_aliases(np):
-            term = term.strip().lower()
-            if term and term in t and len(term) > best_len:
-                best, best_len = np, len(term)
+            term_norm = normalize_text(term)
+            if term_norm and term_norm in t_norm and len(term_norm) > best_len:
+                best, best_len = np, len(term_norm)
     return best
 
 
 def load_target_newspapers():
     """Load target newspapers configuration from config_newspapers.json or environment variables."""
+    loaded_data = None
     if os.path.exists(NEWSPAPER_CONFIG_FILE):
         try:
             with open(NEWSPAPER_CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, list) and len(data) > 0:
                     print(f"📰 Loaded {len(data)} newspaper(s) from '{NEWSPAPER_CONFIG_FILE}'.")
-                    return data
+                    loaded_data = data
         except Exception as e:
             print(f"⚠️ Error reading '{NEWSPAPER_CONFIG_FILE}': {e}")
 
-    env_val = os.getenv("TARGET_NEWSPAPERS", "").strip()
-    res = []
-    if env_val:
-        if env_val.startswith("["):
-            try:
-                items = json.loads(env_val)
-                for item in items:
-                    if isinstance(item, dict) and "name" in item:
-                        res.append({
-                            "name": str(item["name"]).strip(),
-                            "search": str(item.get("search", item["name"])).strip()
-                        })
-            except json.JSONDecodeError:
-                pass
+    if not loaded_data:
+        env_val = os.getenv("TARGET_NEWSPAPERS", "").strip()
+        res = []
+        if env_val:
+            if env_val.startswith("["):
+                try:
+                    items = json.loads(env_val)
+                    for item in items:
+                        if isinstance(item, dict) and "name" in item:
+                            res.append({
+                                "name": str(item["name"]).strip(),
+                                "search": str(item.get("search", item["name"])).strip()
+                            })
+                except json.JSONDecodeError:
+                    pass
+            if not res:
+                raw_items = env_val.replace("\n", ";").split(";")
+                for part in raw_items:
+                    part = part.strip()
+                    if not part:
+                        continue
+                    if ":" in part:
+                        name_part, search_part = part.split(":", 1)
+                        res.append({"name": name_part.strip(), "search": search_part.strip()})
+                    else:
+                        res.append({"name": part, "search": part})
+
         if not res:
-            raw_items = env_val.replace("\n", ";").split(";")
-            for part in raw_items:
-                part = part.strip()
-                if not part:
-                    continue
-                if ":" in part:
-                    name_part, search_part = part.split(":", 1)
-                    res.append({"name": name_part.strip(), "search": search_part.strip()})
-                else:
-                    res.append({"name": part, "search": part})
+            legacy_search = os.getenv("SEARCH_TERM", "La Provincia Las Palmas").strip()
+            res = [{"name": "La Provincia", "search": f"La Provincia, {legacy_search}"}]
+        loaded_data = res
 
-    if not res:
-        legacy_search = os.getenv("SEARCH_TERM", "La Provincia Las Palmas").strip()
-        res = [{"name": "La Provincia", "search": f"La Provincia, {legacy_search}"}]
+    # Deduplicate entries by accent-normalized name
+    deduped = []
+    seen = {}
+    for item in loaded_data:
+        norm = normalize_text(item["name"])
+        if norm in seen:
+            existing = seen[norm]
+            existing_aliases = get_search_aliases(existing)
+            new_aliases = get_search_aliases(item)
+            combined = list(dict.fromkeys(existing_aliases + new_aliases))
+            existing["search"] = ", ".join(combined)
+        else:
+            seen[norm] = item
+            deduped.append(item)
 
-    save_target_newspapers(res)
-    return res
+    save_target_newspapers(deduped)
+    return deduped
 
 
 TARGET_NEWSPAPERS = load_target_newspapers()
@@ -276,14 +309,18 @@ client = NewClient("session.db")
 
 
 def already_sent_today(newspaper_name: str) -> bool:
-    """Check if we already sent today's paper for a given newspaper (respects skip flag)."""
+    """Check if we already sent today's paper for a given newspaper (respects skip flag, accent-insensitive)."""
     if SKIP_DATE_CHECK:
         return False
-    return SENT_LOG_DATA.get(newspaper_name) == str(local_today())
+    today_str = str(local_today())
+    key_norm = normalize_text(newspaper_name)
+    return SENT_LOG_DATA.get(key_norm) == today_str or SENT_LOG_DATA.get(newspaper_name) == today_str
 
 
 def save_sent_date(newspaper_name: str):
     today_str = str(local_today())
+    key_norm = normalize_text(newspaper_name)
+    SENT_LOG_DATA[key_norm] = today_str
     SENT_LOG_DATA[newspaper_name] = today_str
     try:
         atomic_save_json(SENT_LOG_FILE, SENT_LOG_DATA)
@@ -426,7 +463,7 @@ async def _send_day_header(tg_client, chat):
 
 
 async def _file_already_sent_today(tg_client, chat, custom_name):
-    """Check if a file with this name was already sent to the chat today."""
+    """Check if a file with this name was already sent to the chat today (accent-insensitive)."""
     if SKIP_DATE_CHECK:
         return False
 
@@ -441,7 +478,7 @@ async def _file_already_sent_today(tg_client, chat, custom_name):
     try:
         tz = LOCAL_TZ
         now = datetime.now(tz)
-        target_clean = custom_name.replace(".pdf", "").split(",")[0].strip().lower()
+        target_norm = normalize_text(custom_name.replace(".pdf", "").split(",")[0])
 
         async for msg in tg_client.iter_messages(chat, limit=30):
             if msg and msg.date:
@@ -449,9 +486,9 @@ async def _file_already_sent_today(tg_client, chat, custom_name):
                 if msg_date == now.date():
                     file_name = getattr(msg.file, "name", "") if msg.file else ""
                     msg_text = getattr(msg, "message", "") or getattr(msg, "text", "") or ""
-                    haystack = f"{file_name} {msg_text}".lower()
+                    haystack_norm = normalize_text(f"{file_name} {msg_text}")
 
-                    if target_clean in haystack:
+                    if target_norm and target_norm in haystack_norm:
                         print(f"✅ '{newspaper_name}' detected in Telegram channel history for today.")
                         save_sent_date(newspaper_name)
                         return True
@@ -482,7 +519,7 @@ def send_to_telegram(file_path, custom_name, is_manual: bool = False):
 
             await _send_day_header(tg_client, target_chat)
             await tg_client.send_file(target_chat, file_path)
-            print(f"🚀 Sent to Telegram successfully!")
+            print(f"🚀 Sent '{custom_name}' to Telegram successfully!")
             return True
 
         future = asyncio.run_coroutine_threadsafe(_do_send(), loop)
@@ -599,7 +636,7 @@ def download_file(client, message_ev, newspaper_name: str, is_manual: bool = Fal
             return True
 
     for cycle in range(1, 4):
-        print(f"⏳ --- STARTING METHOD CYCLE {cycle}/3 ---")
+        print(f"⏳ [{newspaper_name}] --- STARTING METHOD CYCLE {cycle}/3 ---")
 
         strategies = [
             ("2 (Raw Message)", lambda: client.download_any(message_ev.Message)),
@@ -616,7 +653,7 @@ def download_file(client, message_ev, newspaper_name: str, is_manual: bool = Fal
                 if data:
                     with open(path, "wb") as f:
                         f.write(data)
-                    print(f"✅ Download successful via Strategy {name}.")
+                    print(f"✅ Download successful for '{custom_name}' via Strategy {name}.")
 
                     if send_to_telegram(path, custom_name, is_manual=is_manual):
                         save_sent_date(newspaper_name)
@@ -651,18 +688,24 @@ _CLAIMED = {}  # newspaper name -> "YYYY-MM-DD"
 
 def try_claim(newspaper_name: str) -> bool:
     today = str(local_today())
+    key_norm = normalize_text(newspaper_name)
     with _CLAIM_LOCK:
-        if _CLAIMED.get(newspaper_name) == today:
+        if _CLAIMED.get(key_norm) == today or _CLAIMED.get(newspaper_name) == today:
             return False
-        if not SKIP_DATE_CHECK and SENT_LOG_DATA.get(newspaper_name) == today:
+        if not SKIP_DATE_CHECK and already_sent_today(newspaper_name):
             return False
+        _CLAIMED[key_norm] = today
         _CLAIMED[newspaper_name] = today
         return True
 
 
 def release_claim(newspaper_name: str):
+    key_norm = normalize_text(newspaper_name)
+    today = str(local_today())
     with _CLAIM_LOCK:
-        if _CLAIMED.get(newspaper_name) == str(local_today()):
+        if _CLAIMED.get(key_norm) == today:
+            _CLAIMED.pop(key_norm, None)
+        if _CLAIMED.get(newspaper_name) == today:
             _CLAIMED.pop(newspaper_name, None)
 
 
@@ -933,9 +976,12 @@ def on_message(client: NewClient, message: MessageEv):
         print(f"⚠️ Error in on_message: {e}")
 
 
+_is_first_connect = True
+
+
 @client.event(ConnectedEv)
 def on_connected(client: NewClient, event: ConnectedEv):
-    global _wa_is_connected, _disconnect_timer, _disconnect_alert_sent
+    global _wa_is_connected, _disconnect_timer, _disconnect_alert_sent, _is_first_connect
     with _disconnect_lock:
         _wa_is_connected = True
         if _disconnect_timer is not None:
@@ -946,31 +992,38 @@ def on_connected(client: NewClient, event: ConnectedEv):
             _disconnect_alert_sent = False
             send_telegram_alert("✅ *WhatsApp Connection Restored*\nWhatsApp connection has been successfully re-established.")
 
-    mode = "DEV (skip-date-check)" if SKIP_DATE_CHECK else "PRODUCTION"
-    print(f"🚀 Monitoring Group: {TARGET_GROUP_ID} [{mode}]")
-    print("📰 Target Newspapers:")
-    for np in TARGET_NEWSPAPERS:
-        status = "Completed" if already_sent_today(np["name"]) else "Pending"
-        aliases = ", ".join(get_search_aliases(np))
-        print(f"   • {np['name']} (Aliases: '{aliases}') → {status}")
-    print(f"📨 Telegram target: {TELEGRAM_NEWSPAPERS_CHAT_NAME}")
+    if _is_first_connect:
+        _is_first_connect = False
+        mode = "DEV (skip-date-check)" if SKIP_DATE_CHECK else "PRODUCTION"
+        print(f"🚀 Monitoring Group: {TARGET_GROUP_ID} [{mode}]")
+        print("📰 Target Newspapers:")
+        for np in TARGET_NEWSPAPERS:
+            status = "Completed" if already_sent_today(np["name"]) else "Pending"
+            aliases = ", ".join(get_search_aliases(np))
+            print(f"   • {np['name']} (Aliases: '{aliases}') → {status}")
+        print(f"📨 Telegram target: {TELEGRAM_NEWSPAPERS_CHAT_NAME}")
 
-    # Log all groups to help discover group IDs
-    print("\n📋 Your WhatsApp groups:")
-    try:
-        groups = client.get_joined_groups()
-        for g in groups:
-            gid = f"{g.JID.User}@{g.JID.Server}"
-            name = g.GroupName.Name if hasattr(g.GroupName, 'Name') else 'Unknown'
-            print(f"   • {name} → {gid}")
-    except Exception as e:
-        print(f"   ⚠️ Could not list groups: {e}")
-    print()
+        # Log all groups to help discover group IDs
+        print("\n📋 Your WhatsApp groups:")
+        try:
+            groups = client.get_joined_groups()
+            for g in groups:
+                gid = f"{g.JID.User}@{g.JID.Server}"
+                name = g.GroupName.Name if hasattr(g.GroupName, 'Name') else 'Unknown'
+                print(f"   • {name} → {gid}")
+        except Exception as e:
+            print(f"   ⚠️ Could not list groups: {e}")
+        print()
 
-    # If --retry flag was passed, scan recent messages for unsent newspapers
-    if RETRY_MODE:
-        print("🔄 RETRY MODE: Scanning recent group messages...")
-        _retry_scan(client)
+        if RETRY_MODE:
+            print("🔄 RETRY MODE: Scanning recent group messages...")
+            _retry_scan(client)
+    else:
+        print("🚀 WhatsApp reconnected successfully!")
+        pending_nps = [np for np in TARGET_NEWSPAPERS if not already_sent_today(np["name"])]
+        if pending_nps:
+            print(f"🔍 Auto-scanning history for {len(pending_nps)} pending newspaper(s) after reconnect...")
+            _retry_scan(client)
 
 
 @client.event(DisconnectedEv)
