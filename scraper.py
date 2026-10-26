@@ -111,8 +111,6 @@ _disconnect_timer = None
 _disconnect_alert_sent = False
 _disconnect_lock = threading.Lock()
 
-NEWSPAPER_CONFIG_FILE = "config_newspapers.json"
-
 
 def atomic_save_json(filepath: str, data) -> bool:
     """Save data to JSON atomically using a temporary file to prevent corruption on crash or restart."""
@@ -131,15 +129,6 @@ def atomic_save_json(filepath: str, data) -> bool:
             except Exception:
                 pass
         raise e
-
-
-def save_target_newspapers(newspapers_list):
-    """Save the active newspapers list to config_newspapers.json atomically."""
-    try:
-        atomic_save_json(NEWSPAPER_CONFIG_FILE, newspapers_list)
-        print(f"💾 Saved {len(newspapers_list)} newspaper configuration(s) to '{NEWSPAPER_CONFIG_FILE}'.")
-    except Exception as e:
-        print(f"⚠️ Failed to save newspaper config: {e}")
 
 
 def get_search_aliases(np_entry: dict) -> list:
@@ -183,54 +172,49 @@ def find_newspaper(text: str):
 
 
 def load_target_newspapers():
-    """Load target newspapers configuration from config_newspapers.json or environment variables."""
-    loaded_data = None
-    if os.path.exists(NEWSPAPER_CONFIG_FILE):
+    """Load target newspapers configuration directly from environment variables (.env)."""
+    # Clean up any legacy config_newspapers.json file to prevent stale state
+    if os.path.exists("config_newspapers.json"):
         try:
-            with open(NEWSPAPER_CONFIG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list) and len(data) > 0:
-                    print(f"📰 Loaded {len(data)} newspaper(s) from '{NEWSPAPER_CONFIG_FILE}'.")
-                    loaded_data = data
-        except Exception as e:
-            print(f"⚠️ Error reading '{NEWSPAPER_CONFIG_FILE}': {e}")
+            os.remove("config_newspapers.json")
+            print("🧹 Removed legacy 'config_newspapers.json'. Target newspapers are loaded directly from .env.")
+        except Exception:
+            pass
 
-    if not loaded_data:
-        env_val = os.getenv("TARGET_NEWSPAPERS", "").strip()
-        res = []
-        if env_val:
-            if env_val.startswith("["):
-                try:
-                    items = json.loads(env_val)
-                    for item in items:
-                        if isinstance(item, dict) and "name" in item:
-                            res.append({
-                                "name": str(item["name"]).strip(),
-                                "search": str(item.get("search", item["name"])).strip()
-                            })
-                except json.JSONDecodeError:
-                    pass
-            if not res:
-                raw_items = env_val.replace("\n", ";").split(";")
-                for part in raw_items:
-                    part = part.strip()
-                    if not part:
-                        continue
-                    if ":" in part:
-                        name_part, search_part = part.split(":", 1)
-                        res.append({"name": name_part.strip(), "search": search_part.strip()})
-                    else:
-                        res.append({"name": part, "search": part})
-
+    env_val = os.getenv("TARGET_NEWSPAPERS", "").strip()
+    res = []
+    if env_val:
+        if env_val.startswith("["):
+            try:
+                items = json.loads(env_val)
+                for item in items:
+                    if isinstance(item, dict) and "name" in item:
+                        res.append({
+                            "name": str(item["name"]).strip(),
+                            "search": str(item.get("search", item["name"])).strip()
+                        })
+            except json.JSONDecodeError:
+                pass
         if not res:
-            legacy_search = os.getenv("SEARCH_TERM", "La Provincia Las Palmas").strip()
-            res = [{"name": "La Provincia", "search": f"La Provincia, {legacy_search}"}]
-        loaded_data = res
+            raw_items = env_val.replace("\n", ";").split(";")
+            for part in raw_items:
+                part = part.strip()
+                if not part:
+                    continue
+                if ":" in part:
+                    name_part, search_part = part.split(":", 1)
+                    res.append({"name": name_part.strip(), "search": search_part.strip()})
+                else:
+                    res.append({"name": part, "search": part})
+
+    if not res:
+        legacy_search = os.getenv("SEARCH_TERM", "La Provincia Las Palmas").strip()
+        res = [{"name": "La Provincia", "search": f"La Provincia, {legacy_search}"}]
 
     # Deduplicate entries by accent-normalized name
     deduped = []
     seen = {}
-    for item in loaded_data:
+    for item in res:
         norm = normalize_text(item["name"])
         if norm in seen:
             existing = seen[norm]
@@ -242,7 +226,7 @@ def load_target_newspapers():
             seen[norm] = item
             deduped.append(item)
 
-    save_target_newspapers(deduped)
+    print(f"📰 Loaded {len(deduped)} target newspaper(s) from .env.")
     return deduped
 
 
@@ -794,15 +778,13 @@ def process_bot_command(text: str) -> str:
         existing = next((np for np in TARGET_NEWSPAPERS if np["name"].lower() == display_name.lower()), None)
         if existing:
             existing["search"] = search_terms
-            save_target_newspapers(TARGET_NEWSPAPERS)
             aliases_str = ", ".join(f"`{a}`" for a in get_search_aliases(existing))
-            return f"✏️ Updated newspaper *{display_name}*\nSearch aliases: {aliases_str}"
+            return f"✏️ Updated newspaper *{display_name}* (active for this session)\nSearch aliases: {aliases_str}\n💡 *Note*: To persist across restarts, update `TARGET_NEWSPAPERS` in `.env`."
         else:
             new_np = {"name": display_name, "search": search_terms}
             TARGET_NEWSPAPERS.append(new_np)
-            save_target_newspapers(TARGET_NEWSPAPERS)
             aliases_str = ", ".join(f"`{a}`" for a in get_search_aliases(new_np))
-            return f"✅ Added newspaper *{display_name}*\nSearch aliases: {aliases_str}"
+            return f"✅ Added newspaper *{display_name}* (active for this session)\nSearch aliases: {aliases_str}\n💡 *Note*: To persist across restarts, update `TARGET_NEWSPAPERS` in `.env`."
 
     elif cmd == "/remove":
         if not arg:
@@ -813,16 +795,15 @@ def process_bot_command(text: str) -> str:
             return f"❌ Newspaper *{arg}* not found in active list.\nUse `/list` to view active newspapers."
         for np in matching:
             TARGET_NEWSPAPERS.remove(np)
-        save_target_newspapers(TARGET_NEWSPAPERS)
-        return f"🗑️ Removed *{arg}* from target newspapers list."
+        return f"🗑️ Removed *{arg}* from target newspapers list (active for this session).\n💡 *Note*: To persist across restarts, update `TARGET_NEWSPAPERS` in `.env`."
 
     elif cmd in ("/help", "/start"):
         return (
             "🤖 *Newspaper Scraper Commands*:\n\n"
             "• `/status` - Show today's delivery status for all newspapers\n"
             "• `/list` - List all active target newspapers\n"
-            "• `/add SearchTerm:DisplayName` - Add or update a target newspaper\n"
-            "• `/remove DisplayName` - Remove a newspaper from the list\n"
+            "• `/add DisplayName:search1, search2` - Add or update a target newspaper (session)\n"
+            "• `/remove DisplayName` - Remove a newspaper from the list (session)\n"
             "• `/help` - Show this help message\n\n"
             "📄 *Plan B*: Upload a PDF directly to this chat to forward it to your Telegram channel!"
         )

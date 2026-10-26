@@ -35,7 +35,6 @@ A robust, automated WhatsApp bot that monitors a specific group for daily newspa
     ├── Dockerfile
     ├── scraper.py
     ├── naming_utils.py
-    ├── config_newspapers.json    # Target newspapers & search aliases
     ├── last_sent.json            # Persistent delivery tracking log
     ├── session.db                # Created after WhatsApp QR scan
     └── telegram_session.session  # Created after Telegram auth
@@ -151,11 +150,10 @@ Scan the QR code with WhatsApp → Linked Devices.
 
 * `scraper.py` — Main bot logic, event listeners, dual client engine, and download/upload strategies.
 * `naming_utils.py` — Helper to format newspaper names with Spanish dates.
-* `config_newspapers.json` — Persisted active newspaper names and search aliases.
 * `last_sent.json` — Persistent delivery log tracking sent dates.
 * `Dockerfile` — Container image definition.
 * `docker-compose.yml` — Compose configuration.
-* `.env` — Private configuration file.
+* `.env` — Private configuration file (defines target newspapers and search aliases).
 
 ## ⚠️ Disclaimer
 
